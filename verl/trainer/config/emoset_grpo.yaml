@@ -1,0 +1,150 @@
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Paths are absolute so Ray workers use the same local files.
+project_root: /data/xiyan.zhao/work/Draftout
+data_dir: ${project_root}/outputs/emoset_grpo/data
+dry_run: false
+
+data:
+  cache_dir: ${project_root}/outputs/emoset_grpo/cache/verl
+  train_files: ["${data_dir}/train.parquet"]
+  val_files: ["${data_dir}/val.parquet"]
+  train_batch_size: 16
+  max_prompt_length: 1024
+  max_response_length: 16
+  image_patch_size: 16
+  # Do not silently remove any of the selected 2,000 examples.
+  filter_overlong_prompts: false
+  truncation: error
+  dataloader_num_workers: 2
+  seed: 42
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+actor_rollout_ref:
+  model:
+    path: /data/xiyan.zhao/work/model/Qwen3.5-4B
+    enable_gradient_checkpointing: true
+    # Keep an explicit batch dimension for Qwen3.5 recurrent attention.
+    # Removing padding would concatenate independent samples into one sequence.
+    use_remove_padding: false
+    use_fused_kernels: false
+    override_config:
+      attn_implementation: flash_attention_2
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 16
+    ppo_epochs: 1
+    use_dynamic_bsz: false
+    ulysses_sequence_parallel_size: 1
+    use_torch_compile: false
+    policy_loss:
+      loss_mode: vanilla
+    # Keep the inherited object because the legacy trainer reads its fields.
+    # Only loss_mode=vopd enables distillation; none of it is used here.
+    self_distillation:
+      full_logit_distillation: false
+      distillation_topk: null
+      teacher_always_on: false
+      teacher_image_key: null
+      teacher_prompt_mode: null
+    use_kl_loss: false
+    kl_loss_coef: 0.0
+    entropy_coeff: 0.0
+    loss_agg_mode: seq-mean-token-mean
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    # Disable the extra dual-clip bound; verl caps exp(log_ratio) at exp(20).
+    clip_ratio_c: 1.0e9
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.0
+    fsdp_config:
+      model_dtype: bfloat16
+      dtype: bfloat16
+      param_offload: true
+      optimizer_offload: true
+      use_torch_compile: false
+  rollout:
+    name: vllm
+    mode: async
+    dtype: bfloat16
+    n: 4
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    do_sample: true
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_model_len: 1040
+    max_num_batched_tokens: 4096
+    max_num_seqs: 32
+    log_prob_micro_batch_size_per_gpu: 16
+    log_prob_use_dynamic_bsz: false
+    calculate_log_probs: false
+    engine_kwargs:
+      vllm:
+        compilation_config:
+          pass_config:
+            fuse_allreduce_rms: false
+        kernel_config:
+          enable_flashinfer_autotune: false
+    val_kwargs:
+      n: 1
+      temperature: 0.0
+      do_sample: false
+    agent:
+      num_workers: 2
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_ctrl:
+    kl_coef: 0.0
+  rollout_correction:
+    rollout_is: null
+    rollout_rs: null
+    bypass_mode: false
+
+critic:
+  enable: false
+
+reward_model:
+  enable: false
+  use_reward_loop: false
+
+reward_manager:
+  name: naive
+
+custom_reward_function:
+  path: ${project_root}/emotion_grpo/reward.py
+  name: compute_score
+
+trainer:
+  project_name: Draftout
+  experiment_name: emoset_grpo_2k
+  logger: [console]
+  nnodes: 1
+  n_gpus_per_node: 2
+  use_legacy_worker_impl: enable
+  total_epochs: 1
+  val_before_train: true
+  test_freq: 25
+  save_freq: 25
+  max_actor_ckpt_to_keep: 2
+  resume_mode: disable
+  default_local_dir: ${project_root}/outputs/emoset_grpo/checkpoints/${trainer.experiment_name}
+  validation_data_dir: ${trainer.default_local_dir}/validation
+
+hydra:
+  run:
+    dir: ${trainer.default_local_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false
