@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from collections import Counter
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .data import LABELS, Sample, load_emo8, load_emotion6, load_emoset
@@ -31,7 +32,13 @@ def data_fingerprint(samples: list[Sample]) -> str:
     return digest.hexdigest()
 
 
-def read_predictions(path: Path, samples: list[Sample], labels: tuple[str, ...]) -> list[dict]:
+def read_predictions(
+    path: Path,
+    samples: list[Sample],
+    labels: tuple[str, ...],
+    *,
+    prediction_parser: Callable[[str, Sequence[str]], str | None] = parse_prediction,
+) -> list[dict]:
     """Validate saved results before skipping them on a resumed run."""
     if not path.exists():
         return []
@@ -62,7 +69,7 @@ def read_predictions(path: Path, samples: list[Sample], labels: tuple[str, ...])
                 or record.get("image_path") != str(sample.image_path)
                 or not isinstance(record.get("raw_output"), str)
                 or "prediction" not in record
-                or record["prediction"] != parse_prediction(record["raw_output"], labels)
+                or record["prediction"] != prediction_parser(record["raw_output"], labels)
             ):
                 raise ValueError(f"Saved prediction does not match current data/parser: {sample.sample_id}")
             record["correct"] = record["prediction"] == sample.label

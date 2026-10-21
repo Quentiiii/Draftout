@@ -18,6 +18,22 @@ def parse_prediction(text: str, labels: Sequence[str]) -> str | None:
     return canonical_label(text, labels)
 
 
+def parse_draft_response(text: str, labels: Sequence[str]) -> tuple[str | None, str | None]:
+    """Extract the explanation and score only the single final boxed label."""
+    match = re.fullmatch(r"\s*<draft>(.*?)</draft>\s*\\boxed\{([^{}]*)\}\s*", text, flags=re.DOTALL)
+    if match is None:
+        return None, None
+    draft = match.group(1).strip()
+    if not draft or re.search(r"</?draft\b", draft, flags=re.IGNORECASE):
+        return None, None
+    return draft, canonical_label(match.group(2), labels)
+
+
+def parse_draft_prediction(text: str, labels: Sequence[str]) -> str | None:
+    """Prediction-only adapter used when validating saved draft-format outputs."""
+    return parse_draft_response(text, labels)[1]
+
+
 def classification_metrics(records: Sequence[dict], labels: Sequence[str]) -> dict:
     """Invalid answers remain in the denominator and count as false negatives."""
     labels = list(labels)

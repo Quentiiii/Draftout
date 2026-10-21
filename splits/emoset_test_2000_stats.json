@@ -1,0 +1,58 @@
+{
+  "source": "../dataset/EMOSET/test.json",
+  "output": "splits/emoset_test_2000.json",
+  "seed": 20260612,
+  "target_total": 2000,
+  "source_total": 17716,
+  "subset_total": 2000,
+  "source_counts": {
+    "amusement": 2770,
+    "anger": 1708,
+    "awe": 2260,
+    "contentment": 2484,
+    "disgust": 1661,
+    "excitement": 3014,
+    "fear": 1974,
+    "sadness": 1845
+  },
+  "target_counts": {
+    "amusement": 313,
+    "anger": 193,
+    "awe": 255,
+    "contentment": 280,
+    "disgust": 188,
+    "excitement": 340,
+    "fear": 223,
+    "sadness": 208
+  },
+  "subset_counts": {
+    "excitement": 340,
+    "sadness": 208,
+    "anger": 193,
+    "awe": 255,
+    "fear": 223,
+    "contentment": 280,
+    "disgust": 188,
+    "amusement": 313
+  },
+  "source_ratio": {
+    "amusement": 0.1563558365319485,
+    "anger": 0.09641002483630616,
+    "awe": 0.12756829984195078,
+    "contentment": 0.14021223752540077,
+    "disgust": 0.09375705576879657,
+    "excitement": 0.1701286972228494,
+    "fear": 0.11142470083540303,
+    "sadness": 0.10414314743734478
+  },
+  "subset_ratio": {
+    "amusement": 0.1565,
+    "anger": 0.0965,
+    "awe": 0.1275,
+    "contentment": 0.14,
+    "disgust": 0.094,
+    "excitement": 0.17,
+    "fear": 0.1115,
+    "sadness": 0.104
+  }
+}

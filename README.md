@@ -185,6 +185,101 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 bash scripts/run_emotion_baseline.sh \
 python -m unittest discover -s tests -v
 ```
 
+## DeepSeek-V4.1-Flash：EmoSet 测试集 2,000 张
+
+入口为 `scripts/run_deepseek_emoset.sh`，Python 模块为 `emotion_eval.deepseek`。
+模型参数默认使用官方 API 名称 `deepseek-flash`，对应 V4.1-Flash 系列；
+这是服务端维护的别名，实际返回的模型名称会随结果保存。
+模型名称参考 [DeepSeek 官方发布说明](https://api-docs.deepseek.com/news/news260910/)，
+图像请求格式参考 [Vision 文档](https://api-docs.deepseek.com/guides/vision/)。
+脚本设置 `temperature=0`，使用 `emotion_eval/prompts.py` 中的 `DEEPSEEK_EMOTION_PROMPT`：
+先用 2–4 句话解释图片中的视觉依据，将解释放在 `<draft>...</draft>` 内，
+然后以 `\boxed{类别}` 给出唯一答案，例如：
+
+```text
+<draft>
+The dark, threatening scene and tense posture convey a sense of danger.
+</draft>
+\boxed{Fear}
+```
+
+解释和答案一起生成在 API 的 `content` 中并保存；API 的独立 thinking 模式保持关闭，
+相关参数见 [Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode/)。
+评分仅使用 `</draft>` 后的唯一 `\boxed{}` 类别，解释中提到的其他情绪不参与评分。
+
+默认使用项目中的 `splits/emoset_test_2000.json`，从此前
+`Qwen3-VL/splits/emoset_test_2000.json` 原样复制，保持实验样本一致。
+该清单来自官方 `test.json` 的 17,716 张测试图片，按原始类别比例分层抽样，
+seed 为 `20260612`，包含 2,000 张互不重复的图片，不包含训练样本。
+运行时检查清单属于官方测试集、图片与 annotation 存在、annotation 的 emotion 与清单一致。
+这里的测试子集与下方 GRPO 训练用的 2,000 张样本相互独立。
+
+依赖仅为 **Python 3.10+ 和 Pillow**，无需本地模型或 GPU。
+启动脚本默认使用已有的 `vision-opd` Python，可通过 `PYTHON_BIN=/path/to/python` 覆盖。
+API key 通过环境变量 `DEEPSEEK_API_KEY`，或启动脚本读取的项目根目录 `.deepseek.env` 提供；
+该本地文件已加入 Git 忽略规则。首次使用：
+
+```bash
+cd /data/xiyan.zhao/work/Draftout
+cp .deepseek.env.example .deepseek.env
+# 编辑 .deepseek.env，填入自己的 DEEPSEEK_API_KEY。
+
+# 不需要 API key：校验数据与图片解码，不请求 API、不写输出文件。
+bash scripts/run_deepseek_emoset.sh --dry-run
+
+# 填好 key 后，先用清单前 2 张检查真实 API；结果放在独立目录。
+bash scripts/run_deepseek_emoset.sh \
+  --limit 2 --output-dir outputs/deepseek_emoset_smoke
+
+# 完整运行清单中的 2,000 张。
+bash scripts/run_deepseek_emoset.sh
+
+# 中断或 API 错误后，在同一输出目录继续。
+bash scripts/run_deepseek_emoset.sh --resume
+```
+
+仅有 API key 配置不会自动发起请求；执行非 `--dry-run` 命令才会调用 API。
+若使用其他 Python，可先执行 `/path/to/python -m pip install Pillow`，再运行
+`PYTHON_BIN=/path/to/python bash scripts/run_deepseek_emoset.sh`。
+也可在项目根目录直接执行 `python -m emotion_eval.deepseek`，此时自行设置环境变量
+`DEEPSEEK_API_KEY`，不会通过启动脚本加载 `.deepseek.env`。
+
+常用参数如下，完整选项见 `bash scripts/run_deepseek_emoset.sh --help`：
+
+| 参数 | 默认值与用途 |
+| --- | --- |
+| `--data-root` | `/data/xiyan.zhao/work/dataset/EMOSET`，直接指向含 `test.json` 的目录 |
+| `--test-list` | 项目内 `splits/emoset_test_2000.json`，可指定相同三列格式的测试子集清单 |
+| `--limit` | 默认不截断；指定时仅运行清单前 N 张，用于检查流程 |
+| `--workers` | `4`，并发请求数 |
+| `--model` | `deepseek-flash` |
+| `--base-url` | `https://api.deepseek.com` |
+| `--max-tokens` | `512`，单张图片解释与最终答案的总生成 token 上限 |
+| `--max-image-side` | `1024`，发送图片的最长边上限 |
+| `--timeout` | `120`，单次请求超时秒数 |
+| `--max-retries` | `3`，可重试错误的最大重试次数 |
+
+发送前按 EXIF 方向转正图片，只缩小、不放大，转换为 RGB JPEG，质量设为 95，
+移除图片元数据。通过 base64 发送图像内容，图片路径、文件名和真值标签不进入提示词。
+`--dry-run` 会核对标签并解码所有选中图片，适合在付费请求前检查数据完整性。
+
+默认输出目录为 `outputs/deepseek_v41_flash_emoset_2k/`：
+
+- `config.json`：模型、提示词、请求参数、图像处理参数和数据指纹。
+- `samples.json`：本次实际选择的样本清单。
+- `predictions.jsonl`：逐图完整 `raw_output`、单独的 `draft` 解释、预测类别、真值与 token 使用量。
+- `errors.jsonl`：失败请求记录，便于排查和续跑。
+- `metrics.json`：完成状态、样本进度、Accuracy、Macro-F1、逐类指标、混淆矩阵和 token 使用量。
+
+默认拒绝覆盖已有运行文件；重复实验使用新的 `--output-dir`，恢复已有实验使用 `--resume`。
+续跑会校验数据及配置，并跳过已保存的成功 API 响应；旧版仅输出标签的实验不能与新提示词续跑混用，
+可用 `--output-dir outputs/deepseek_v41_flash_emoset_2k_draft` 开始新实验。
+成功返回但缺少非空 `<draft>...</draft>`、末尾唯一 `\boxed{合法类别}` 或含额外文字的输出
+计错且不自动重试，完整原始回答仍会保存。请求错误达到重试上限后，程序等待当前并发批次结束、
+保存已完成结果并退出；续跑会重新处理失败和未完成样本。
+网络失败保持待处理状态，不充当模型分类错误。`metrics.json` 的 `complete` 为 `true`
+时才是本次清单的完整评估，否则指标仅反映已完成部分；`--limit` 的小样本结果不代表 2,000 张性能。
+
 ## EmoSet 2k 纯 GRPO 训练
 
 入口是 `scripts/run_emoset_grpo.sh`，默认直接调用已有的 `vision-opd` 解释器，

@@ -64,14 +64,15 @@ def _relative_file(root: Path, value: Any, context: str) -> tuple[str, Path]:
     return relative.as_posix(), path
 
 
-def load_emoset(root: Path) -> list[Sample]:
-    """Read only test.json and use each annotation's emotion as the answer.
+def load_emoset(root: Path, test_list: Path | None = None) -> list[Sample]:
+    """Read test.json (or an explicit list) and use annotation emotions as answers.
 
     The redundant emotion in test.json must match the annotation. Filename and
-    directory names never determine the answer for EmoSet.
+    directory names never determine the answer for EmoSet. Callers providing
+    a subset list are responsible for checking its official split membership.
     """
     root = Path(root).expanduser().resolve()
-    split_path = root / "test.json"
+    split_path = Path(test_list).expanduser().resolve() if test_list is not None else root / "test.json"
     rows = _read_json(split_path)
     if not isinstance(rows, list) or not rows:
         raise ValueError(f"{split_path}: expected a nonempty list of test samples")
