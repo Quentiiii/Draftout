@@ -11,9 +11,10 @@ data:
   cache_dir: ${project_root}/outputs/emoset_grpo/cache/verl
   train_files: ["${data_dir}/train.parquet"]
   val_files: ["${data_dir}/val.parquet"]
-  train_batch_size: 16
+  train_batch_size: 8
   max_prompt_length: 1024
-  max_response_length: 16
+  # Shared <draft> explanation followed by the boxed emotion label.
+  max_response_length: 512
   image_patch_size: 16
   # Do not silently remove any of the selected 2,000 examples.
   filter_overlong_prompts: false
@@ -25,7 +26,7 @@ data:
 
 actor_rollout_ref:
   model:
-    path: /data/xiyan.zhao/work/model/Qwen3.5-4B
+    path: /data/xiyan.zhao/work/model/Qwen3.5-2B
     enable_gradient_checkpointing: true
     # Keep an explicit batch dimension for Qwen3.5 recurrent attention.
     # Removing padding would concatenate independent samples into one sequence.
@@ -35,7 +36,7 @@ actor_rollout_ref:
       attn_implementation: flash_attention_2
   actor:
     strategy: fsdp2
-    ppo_mini_batch_size: 16
+    ppo_mini_batch_size: 8
     ppo_micro_batch_size_per_gpu: 16
     ppo_epochs: 1
     use_dynamic_bsz: false
@@ -82,7 +83,7 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.5
     enforce_eager: true
     enable_prefix_caching: false
-    max_model_len: 1040
+    max_model_len: 1536
     max_num_batched_tokens: 4096
     max_num_seqs: 32
     log_prob_micro_batch_size_per_gpu: 16
@@ -134,12 +135,14 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 2
   use_legacy_worker_impl: enable
-  total_epochs: 1
+  # Total includes completed epochs: step 250 -> 2500 with the default batch.
+  total_epochs: 10
   val_before_train: true
   test_freq: 25
   save_freq: 25
   max_actor_ckpt_to_keep: 2
-  resume_mode: disable
+  # Restore model, optimizer, scheduler, RNG and dataloader from the latest step.
+  resume_mode: auto
   default_local_dir: ${project_root}/outputs/emoset_grpo/checkpoints/${trainer.experiment_name}
   validation_data_dir: ${trainer.default_local_dir}/validation
 

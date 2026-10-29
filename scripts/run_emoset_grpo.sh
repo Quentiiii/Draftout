@@ -3,10 +3,10 @@ set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${PYTHON_BIN:-/data/xiyan.zhao/anaconda3/envs/vision-opd/bin/python}"
-model_path="${MODEL_PATH:-/data/xiyan.zhao/work/model/Qwen3.5-4B}"
+model_path="${MODEL_PATH:-/data/xiyan.zhao/work/model/Qwen3.5-2B}"
 dataset_root="${EMOSET_ROOT:-/data/xiyan.zhao/work/dataset/EMOSET}"
 data_dir="${DATA_DIR:-$project_dir/outputs/emoset_grpo/data}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-1,2}"
 
 batch_size="${BATCH_SIZE:-16}"
 gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS:-1}"
@@ -26,29 +26,31 @@ case "${1-}" in
   --help|-h)
     cat <<'EOF'
 用法：bash scripts/run_emoset_grpo.sh [--prepare-only|--check|--smoke] [Hydra overrides...]
-  默认：准备固定 2,000 条训练数据，然后训练 1 epoch。
+  默认：准备固定 2,000 条训练数据，从最新 checkpoint 续训到总共 10 epochs。
+  当前 global_step_250 已完成 1 epoch；默认 batch 下继续到 step 2500，再跑 9 epochs。
+  没有 checkpoint 时从头训练；总轮数由 trainer.total_epochs 控制（不是追加轮数）。
   --prepare-only：只准备 train/val parquet 和样本清单。
   --check：CPU 检查配置、奖励函数、数据和真实多模态处理器，不加载模型权重。
   --smoke：完整 2k 数据上执行 1 个训练 step，不跑验证；保存到独立 smoke 目录。
 
 训练参数（也可直接修改脚本顶部）：
   BATCH_SIZE=16                   单卡一次前向/反向的回答数
-  GRADIENT_ACCUMULATION_STEPS=2    单卡梯度累积次数；1 表示不累积
+  GRADIENT_ACCUMULATION_STEPS=1    单卡梯度累积次数；1 表示不累积
   ROLLOUT_N=4                     每图采样回答数
   每步图片数 = BATCH_SIZE × 累积次数 × GPU 数 / ROLLOUT_N。
   结果须为整数且能整除 2,000，避免丢弃最后一批数据。
   batch=1 时自动启用单样本去 padding，其余 batch 保留独立批次维度。
 
 其他环境变量：PYTHON_BIN、MODEL_PATH、EMOSET_ROOT、DATA_DIR、CUDA_VISIBLE_DEVICES。
-默认 vision-opd、Qwen3.5-4B、GPU 0,1。GPU 数由 CUDA_VISIBLE_DEVICES 自动计算。
+默认 vision-opd、Qwen3.5-2B、GPU 0,1。GPU 数由 CUDA_VISIBLE_DEVICES 自动计算。
 批次、累积次数及 GPU 数请通过以上变量设置；其他 Hydra 参数可直接追加。
 例如：
   CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_emoset_grpo.sh
   BATCH_SIZE=8 GRADIENT_ACCUMULATION_STEPS=4 bash scripts/run_emoset_grpo.sh
   BATCH_SIZE=16 GRADIENT_ACCUMULATION_STEPS=1 bash scripts/run_emoset_grpo.sh
   MODEL_PATH=/data/xiyan.zhao/work/model/Qwen3.5-2B bash scripts/run_emoset_grpo.sh
-  bash scripts/run_emoset_grpo.sh actor_rollout_ref.actor.optim.lr=5e-7 trainer.total_epochs=5
-  bash scripts/run_emoset_grpo.sh trainer.resume_mode=auto
+  bash scripts/run_emoset_grpo.sh trainer.total_epochs=10
+  bash scripts/run_emoset_grpo.sh trainer.resume_mode=disable trainer.experiment_name=emoset_grpo_2k_new
 EOF
     exit 0 ;;
 esac
@@ -158,6 +160,7 @@ if [[ "$mode" == check ]]; then
 elif [[ "$mode" == smoke ]]; then
   overrides+=(
     "trainer.experiment_name=emoset_grpo_2k_smoke"
+    "trainer.resume_mode=disable"
     "trainer.total_training_steps=1"
     "trainer.val_before_train=false"
     "trainer.test_freq=-1"

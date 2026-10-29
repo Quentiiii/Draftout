@@ -34,6 +34,27 @@ def parse_draft_prediction(text: str, labels: Sequence[str]) -> str | None:
     return parse_draft_response(text, labels)[1]
 
 
+def parse_angles_response(
+    text: str, labels: Sequence[str]
+) -> tuple[str | None, str | None, str | None]:
+    """Parse a draft outline, separate analysis, and one final boxed label."""
+    match = re.fullmatch(
+        r"\s*<draft>(.*?)</draft>\s*(.*?)\s*\\boxed\{([^{}]*)\}\s*",
+        text, flags=re.DOTALL,
+    )
+    if match is None:
+        return None, None, None
+    draft, analysis = match.group(1).strip(), match.group(2).strip()
+    if not draft or not analysis or re.search(r"</?draft\b|\\boxed\b", draft + analysis, flags=re.IGNORECASE):
+        return None, None, None
+    return draft, analysis, canonical_label(match.group(3), labels)
+
+
+def parse_angles_prediction(text: str, labels: Sequence[str]) -> str | None:
+    """Prediction-only adapter for resuming an analysis-angles evaluation."""
+    return parse_angles_response(text, labels)[2]
+
+
 def classification_metrics(records: Sequence[dict], labels: Sequence[str]) -> dict:
     """Invalid answers remain in the denominator and count as false negatives."""
     labels = list(labels)

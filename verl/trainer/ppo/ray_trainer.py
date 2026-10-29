@@ -2018,6 +2018,25 @@ class RayPPOTrainer:
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
+            # A checkpoint saved immediately after the last batch still has an
+            # unfinished iterator: StopIteration has not been requested yet.
+            # fit() already advances current_epoch at this boundary, so leaving
+            # that empty iterator pending would silently skip one whole epoch.
+            # Finish only that iterator, preserving the restored sampler RNG.
+            if (
+                self.global_steps > 0
+                and self.global_steps % len(self.train_dataloader) == 0
+                and dataloader_state_dict.get("_iterator_finished") is False
+            ):
+                try:
+                    next(iter(self.train_dataloader))
+                except StopIteration:
+                    pass
+                else:
+                    raise ValueError(
+                        "Checkpoint global step is at an epoch boundary, but its dataloader still has batches. "
+                        "Resume with the original training dataset and batch size."
+                    )
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 

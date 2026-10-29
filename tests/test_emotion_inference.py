@@ -1,3 +1,4 @@
+import io
 import json
 import tempfile
 import unittest
@@ -5,9 +6,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from emotion_eval.data import LABELS, Sample
+from emotion_eval.deepseek import PROMPT as DEEPSEEK_PROMPT
 from emotion_eval.infer import argument_parser, main, prepare_run, read_predictions
 from emotion_eval.metrics import classification_metrics, parse_prediction
-from emotion_eval.prompts import EMOTION_PROMPT
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT
+
+
+def formatted_answer(label, draft="The image conveys this emotion."):
+    return f"<draft>\n{draft}\n</draft>\n\\boxed{{{label}}}"
 
 
 class ScoringTests(unittest.TestCase):
@@ -90,8 +96,9 @@ class ResumeTests(unittest.TestCase):
 
     def saved_run(self):
         args = argument_parser().parse_args(["--output-dir", str(self.root)])
-        prompt = EMOTION_PROMPT.format(labels=", ".join(LABELS["emotion6"]))
+        prompt = DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(LABELS["emotion6"]))
         run = prepare_run(args, "emotion6", self.samples, "all_images_no_official_test_split", prompt)
+        self.record.update(draft="The image conveys joy.", raw_output=formatted_answer("Joy", "The image conveys joy."))
         self.path = run["directory"] / "predictions.jsonl"
         self.save([self.record])
         (run["directory"] / "metrics.json").write_text('{"old": true}\n', encoding="utf-8")
@@ -146,18 +153,74 @@ class ResumeTests(unittest.TestCase):
             patch("emotion_eval.infer.load_emotion6", return_value=self.samples),
             patch("emotion_eval.infer.QwenPredictor") as predictor,
         ):
-            predictor.return_value.predict.return_value = ["Anger"]
+            predictor.return_value.predict.return_value = [formatted_answer("Anger")]
             self.assertEqual(main([
                 "--datasets", "emotion6", "--model", str(self.root), "--output-dir", str(self.root),
             ]), 0)
         predictions = [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(predictions), 1)
         self.assertEqual(predictions[0]["prediction"], "Anger")
+        self.assertEqual(predictions[0]["draft"], "The image conveys this emotion.")
+        self.assertEqual(predictions[0]["raw_output"], formatted_answer("Anger"))
         predictor.return_value.predict.assert_called_once()
+        self.assertEqual(
+            predictor.return_value.predict.call_args.kwargs["prompt"],
+            DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(LABELS["emotion6"])),
+        )
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         self.assertEqual(list(summary), ["emotion6"])
         self.assertEqual(summary["emotion6"]["num_samples"], 1)
         self.assertEqual(summary["emotion6"]["accuracy"], 0)
+
+    def test_formatted_main_resume_skips_model_and_rejects_legacy_config(self):
+        argv = ["--datasets", "emotion6", "--model", str(self.root), "--output-dir", str(self.root)]
+        with (
+            patch("emotion_eval.infer.load_emotion6", return_value=self.samples),
+            patch("emotion_eval.infer.QwenPredictor") as predictor,
+        ):
+            predictor.return_value.predict.return_value = [formatted_answer("Joy")]
+            self.assertEqual(main(argv), 0)
+            path = self.root / "emotion6/predictions.jsonl"
+            original = path.read_bytes()
+            predictor.reset_mock()
+            self.assertEqual(main([*argv, "--resume"]), 0)
+            predictor.assert_not_called()
+            self.assertEqual(path.read_bytes(), original)
+            config_path = self.root / "emotion6/config.json"
+            config = json.loads(config_path.read_text())
+            self.assertEqual(config["max_new_tokens"], 512)
+            self.assertEqual(config["response_format"], "draft_then_boxed_label")
+            self.assertNotIn("num_shards", config)
+            self.assertNotIn("shard_index", config)
+            config["format_version"] = 1
+            config.pop("response_format")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "format_version"):
+                main([*argv, "--resume"])
+            predictor.assert_not_called()
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_emoset_uses_exact_deepseek_prompt_and_counts_invalid_outputs(self):
+        samples = [Sample("emoset", f"awe/{i}.jpg", self.root / f"awe/{i}.jpg", "Awe") for i in range(4)]
+        draft = "The dark shadows suggest fear, but the vast mountain conveys awe."
+        outputs = [formatted_answer("Awe", draft), "Awe", "<draft>Mountain</draft>\\boxed{Awe", formatted_answer("Joy")]
+        with (
+            patch("emotion_eval.infer.load_emoset", return_value=samples),
+            patch("emotion_eval.infer.QwenPredictor") as predictor,
+        ):
+            predictor.return_value.predict.return_value = outputs
+            self.assertEqual(main([
+                "--datasets", "emoset", "--model", str(self.root), "--output-dir", str(self.root),
+                "--batch-size", "4",
+            ]), 0)
+        self.assertEqual(predictor.return_value.predict.call_args.kwargs["prompt"], DEEPSEEK_PROMPT)
+        records = [json.loads(line) for line in (self.root / "emoset/predictions.jsonl").read_text().splitlines()]
+        self.assertEqual([record["prediction"] for record in records], ["Awe", None, None, None])
+        self.assertEqual(records[0]["draft"], draft)
+        self.assertEqual([record["raw_output"] for record in records], outputs)
+        metrics = json.loads((self.root / "emoset/metrics.json").read_text())
+        self.assertEqual(metrics["num_invalid"], 3)
+        self.assertEqual(metrics["accuracy"], 0.25)
 
     def test_fresh_main_clears_stale_summary_before_model_load(self):
         self.saved_run()
@@ -188,6 +251,63 @@ class ResumeTests(unittest.TestCase):
         )
 
 
+class ShardingTests(unittest.TestCase):
+    def test_shards_partition_limited_dataset_and_report_local_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            samples = [Sample("emotion6", f"joy/{i}.jpg", root / f"joy/{i}.jpg", "Joy") for i in range(6)]
+            selected = []
+            for index in range(2):
+                output = root / f"shard_{index}"
+                with (
+                    patch("emotion_eval.infer.load_emotion6", return_value=samples),
+                    patch("emotion_eval.infer.QwenPredictor") as predictor,
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                ):
+                    predictor.return_value.predict.side_effect = lambda batch, prompt: [formatted_answer("Joy")] * len(batch)
+                    self.assertEqual(main([
+                        "--datasets", "emotion6", "--model", str(root), "--output-dir", str(output),
+                        "--num-shards", "2", "--shard-index", str(index), "--limit", "5", "--batch-size", "2",
+                    ]), 0)
+                records = [json.loads(line) for line in (output / "emotion6/predictions.jsonl").read_text().splitlines()]
+                ids = [record["sample_id"] for record in records]
+                self.assertEqual(ids, [sample.sample_id for sample in samples[:5][index::2]])
+                selected.append(set(ids))
+                report = json.loads(stdout.getvalue().splitlines()[0])
+                self.assertEqual((report["available"], report["selected"]), (6, len(ids)))
+                metrics = json.loads((output / "emotion6/metrics.json").read_text())
+                self.assertEqual(metrics["num_samples"], len(ids))
+                self.assertEqual(metrics["accuracy"], 1.0)
+                config = json.loads((output / "emotion6/config.json").read_text())
+                self.assertEqual((config["num_shards"], config["shard_index"]), (2, index))
+            self.assertFalse(selected[0] & selected[1])
+            self.assertEqual(selected[0] | selected[1], {sample.sample_id for sample in samples[:5]})
+
+    def test_invalid_or_empty_shards_fail_before_model_load(self):
+        with patch("emotion_eval.infer.QwenPredictor") as predictor, patch("sys.stderr", new_callable=io.StringIO):
+            for arguments in (("--num-shards", "0"), ("--shard-index", "-1"), ("--num-shards", "2", "--shard-index", "2")):
+                with self.subTest(arguments=arguments), self.assertRaises(SystemExit) as error:
+                    main(list(arguments))
+                self.assertEqual(error.exception.code, 2)
+            with tempfile.TemporaryDirectory() as directory:
+                sample = Sample("emotion6", "joy/1.jpg", Path(directory) / "joy/1.jpg", "Joy")
+                with patch("emotion_eval.infer.load_emotion6", return_value=[sample]):
+                    with self.assertRaisesRegex(ValueError, "No images selected"):
+                        main(["--datasets", "emotion6", "--model", directory, "--num-shards", "2", "--shard-index", "1"])
+            predictor.assert_not_called()
+
+    def test_resume_rejects_changed_shard_even_with_same_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = argument_parser().parse_args(["--output-dir", directory, "--num-shards", "2"])
+            sample = Sample("emotion6", "joy/1.jpg", Path(directory) / "joy/1.jpg", "Joy")
+            prompt = DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(LABELS["emotion6"]))
+            prepare_run(args, "emotion6", [sample], "all_images_no_official_test_split", prompt)
+            args.resume = True
+            args.shard_index = 1
+            with self.assertRaisesRegex(ValueError, "shard_index"):
+                prepare_run(args, "emotion6", [sample], "all_images_no_official_test_split", prompt)
+
+
 class Emo8IntegrationTests(unittest.TestCase):
     def test_cli_evaluates_all_three_splits_with_emo8_labels(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -199,7 +319,9 @@ class Emo8IntegrationTests(unittest.TestCase):
                 path.touch()
             output = root / "outputs"
             with patch("emotion_eval.infer.QwenPredictor") as predictor:
-                predictor.return_value.predict.side_effect = [["sadness", "AMUSEMENT"], ["Awe"]]
+                predictor.return_value.predict.side_effect = [
+                    [formatted_answer("sadness"), formatted_answer("AMUSEMENT")], [formatted_answer("Awe")]
+                ]
                 self.assertEqual(main([
                     "--datasets", "emo8", "--data-root", str(root), "--model", str(root),
                     "--batch-size", "2", "--output-dir", str(output),
@@ -211,6 +333,7 @@ class Emo8IntegrationTests(unittest.TestCase):
             config = json.loads((output / "emo8/config.json").read_text())
             self.assertEqual(config["split"], "all_train_val_test_as_test")
             self.assertEqual(config["labels"], list(LABELS["emo8"]))
+            self.assertEqual(config["prompt"], DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(LABELS["emo8"])))
             for call in predictor.return_value.predict.call_args_list:
                 self.assertEqual(call.kwargs["prompt"], config["prompt"])
             metrics = json.loads((output / "emo8/metrics.json").read_text())

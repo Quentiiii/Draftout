@@ -17,6 +17,7 @@ from PIL import Image, PngImagePlugin
 from emotion_eval import deepseek
 from emotion_eval.data import LABELS
 from emotion_eval.metrics import parse_draft_prediction, parse_draft_response
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT
 
 
 API_KEY = "dummy-private-api-key"
@@ -318,6 +319,324 @@ class DeepSeekEvaluationTests(unittest.TestCase):
         request.assert_not_called()
         self.assertEqual(self.read_records(), records)
         self.assertEqual(self.read_json("metrics.json")["num_invalid"], 2)
+
+
+class DeepSeekMultiDatasetTests(unittest.TestCase):
+    """Exercise dataset selection and persistence without credentials or API access."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.data_root = self.root / "dataset"
+        self.output_dir = self.root / "results"
+        self.samples = {name: [] for name in ("emoset", "emotion6", "emo8")}
+        self.responses = {}
+        self.emoset_rows = []
+        for index, label in enumerate(("Anger", "Awe", "Sadness")):
+            sample_id = f"images/{index}.png"
+            annotation = f"annotation/{index}.json"
+            self.add_image("emoset", sample_id, label, self.data_root / "EMOSET" / sample_id)
+            path = self.data_root / "EMOSET" / annotation
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"emotion": label.lower()}), encoding="utf-8")
+            self.emoset_rows.append([label.lower(), sample_id, annotation])
+        self.write_emoset_rows()
+        for label in LABELS["emotion6"]:
+            sample_id = f"{label.lower()}/same.png"
+            self.add_image(
+                "emotion6", sample_id, label,
+                self.data_root / "Emotion6" / "Emotion6" / "images" / sample_id,
+            )
+        # This evaluation intentionally follows Qwen's directory labels, not distributions.
+        (self.data_root / "Emotion6" / "Emotion6" / "ground_truth.txt").write_text(
+            "Not used by the directory-label evaluation.\n", encoding="utf-8"
+        )
+        for split in ("train", "val", "test"):
+            for label in LABELS["emo8"]:
+                directory_label = "sad" if label == "Sadness" else label.lower()
+                sample_id = f"{split}/{directory_label}/same.png"
+                self.add_image("emo8", sample_id, label, self.data_root / "EMO8" / sample_id)
+        self.argv = [
+            "--data-root", str(self.data_root), "--output-dir", str(self.output_dir),
+            "--workers", "1",
+        ]
+        self.stdout, self.stderr = io.StringIO(), io.StringIO()
+        self.addCleanup(patch.stopall)
+        patch.dict(os.environ, {"DEEPSEEK_API_KEY": API_KEY}).start()
+        # Fail closed if any test unexpectedly escapes its mocked completion boundary.
+        self.network = patch.object(
+            deepseek.urllib.request, "urlopen", side_effect=AssertionError("Unexpected network request")
+        ).start()
+
+    def add_image(self, dataset, sample_id, label, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        index = sum(len(samples) for samples in self.samples.values()) + 1
+        with Image.new("RGB", (12, 8), color=(index * 7 % 256, index * 19 % 256, index * 31 % 256)) as image:
+            image.save(path)
+        self.samples[dataset].append((sample_id, label, path))
+        url = deepseek.encode_image(path, 1024)
+        self.assertNotIn(url, self.responses)
+        self.responses[url] = (dataset, sample_id, label)
+
+    def write_emoset_rows(self):
+        (self.data_root / "EMOSET" / "test.json").write_text(
+            json.dumps(self.emoset_rows), encoding="utf-8"
+        )
+
+    def run_main(self, *extra):
+        with redirect_stdout(self.stdout), redirect_stderr(self.stderr):
+            return deepseek.main([*self.argv, *extra])
+
+    def request_sample(self, payload):
+        content = payload["messages"][0]["content"]
+        dataset, sample_id, label = self.responses[content[0]["image_url"]["url"]]
+        self.assertEqual(content[1]["text"], DEEPSEEK_EMOTION_PROMPT.format(
+            labels=", ".join(LABELS[dataset])
+        ))
+        return dataset, sample_id, label
+
+    def reply(self, args, api_key, payload):
+        _, _, label = self.request_sample(payload)
+        return completion(formatted_answer(label))
+
+    def read_json(self, filename, dataset=None):
+        directory = self.output_dir / dataset if dataset else self.output_dir
+        return json.loads((directory / filename).read_text(encoding="utf-8"))
+
+    def read_records(self, dataset):
+        path = self.output_dir / dataset / "predictions.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def snapshot(self):
+        return {str(path.relative_to(self.output_dir)): path.read_bytes()
+                for path in self.output_dir.rglob("*") if path.is_file()}
+
+    def test_default_runs_all_datasets_with_their_labels_splits_and_separate_artifacts(self):
+        with patch.object(deepseek, "request_completion", side_effect=self.reply) as request:
+            self.assertEqual(self.run_main(), 0)
+        self.assertEqual(request.call_count, 33)
+        summary = self.read_json("summary.json")
+        self.assertEqual(set(summary), set(self.samples))
+        splits = {
+            "emoset": "official_test", "emotion6": "all_images_no_official_test_split",
+            "emo8": "all_train_val_test_as_test",
+        }
+        for dataset, samples in self.samples.items():
+            with self.subTest(dataset=dataset):
+                self.assertEqual(
+                    {path.name for path in (self.output_dir / dataset).iterdir()}, set(deepseek.ARTIFACTS)
+                )
+                config = self.read_json("config.json", dataset)
+                metrics = self.read_json("metrics.json", dataset)
+                records = self.read_records(dataset)
+                self.assertEqual(config["dataset"], dataset)
+                self.assertEqual(config["labels"], list(LABELS[dataset]))
+                self.assertEqual(config["split"], splits[dataset])
+                self.assertEqual(metrics, summary[dataset])
+                self.assertEqual(metrics["num_selected"], len(samples))
+                self.assertEqual(metrics["num_correct"], len(samples))
+                self.assertEqual(metrics["num_pending"], 0)
+                self.assertTrue(metrics["complete"])
+                self.assertEqual(set(metrics["per_class"]), set(LABELS[dataset]))
+                self.assertEqual({row["sample_id"] for row in records}, {row[0] for row in samples})
+                self.assertEqual({row["dataset"] for row in records}, {dataset})
+        emotion6 = {row["label"]: row for row in self.read_records("emotion6")}
+        self.assertEqual(emotion6["Joy"]["prediction"], "Joy")
+        self.assertEqual(emotion6["Surprise"]["prediction"], "Surprise")
+        self.assertEqual(len({row["sample_id"] for row in self.read_records("emo8")}), 24)
+        self.network.assert_not_called()
+
+    def test_emotion6_rejects_an_emoset_only_label_and_preserves_it_on_resume(self):
+        def reply(args, api_key, payload):
+            _, _, label = self.request_sample(payload)
+            return completion(formatted_answer("Amusement" if label == "Joy" else label))
+
+        with patch.object(deepseek, "request_completion", side_effect=reply):
+            self.assertEqual(self.run_main("--datasets", "emotion6"), 0)
+        records = self.read_records("emotion6")
+        self.assertEqual(next(row for row in records if row["label"] == "Joy")["prediction"], None)
+        metrics = self.read_json("metrics.json", "emotion6")
+        self.assertEqual(metrics["num_invalid"], 1)
+        self.assertEqual(metrics["num_correct"], 5)
+        with patch.object(deepseek, "request_completion") as request:
+            self.assertEqual(self.run_main("--datasets", "emotion6", "--resume"), 0)
+        request.assert_not_called()
+        self.assertEqual(self.read_records("emotion6"), records)
+
+    def test_resume_skips_every_completed_dataset_without_rewriting_predictions(self):
+        with patch.object(deepseek, "request_completion", side_effect=self.reply):
+            self.assertEqual(self.run_main(), 0)
+        saved = {dataset: (self.output_dir / dataset / "predictions.jsonl").read_bytes()
+                 for dataset in self.samples}
+        with patch.object(deepseek, "request_completion") as request:
+            self.assertEqual(self.run_main("--resume", "--workers", "2"), 0)
+        request.assert_not_called()
+        for dataset in self.samples:
+            self.assertEqual((self.output_dir / dataset / "predictions.jsonl").read_bytes(), saved[dataset])
+        self.assertTrue(all(metrics["complete"] for metrics in self.read_json("summary.json").values()))
+
+    def test_legacy_subset_cannot_write_flat_artifacts_into_an_existing_multi_dataset_run(self):
+        with patch.object(deepseek, "request_completion", side_effect=self.reply):
+            self.assertEqual(self.run_main(), 0)
+        test_list = self.root / "legacy_subset.json"
+        test_list.write_text(json.dumps(self.emoset_rows), encoding="utf-8")
+        original = self.snapshot()
+        with patch.object(deepseek, "request_completion") as request:
+            for extra in ((), ("--resume",)):
+                with self.subTest(extra=extra), self.assertRaises(ValueError):
+                    self.run_main("--data-root", str(self.data_root / "EMOSET"),
+                                  "--test-list", str(test_list), *extra)
+        request.assert_not_called()
+        self.assertEqual(self.snapshot(), original)
+        self.assertFalse((self.output_dir / "config.json").exists())
+
+    def test_failure_keeps_later_dataset_pending_and_resume_requests_only_remaining_images(self):
+        first_call = True
+
+        def reply(args, api_key, payload):
+            nonlocal first_call
+            dataset, _, label = self.request_sample(payload)
+            if first_call:
+                first_call = False
+                summary = self.read_json("summary.json")
+                self.assertEqual(set(summary), set(self.samples))
+                self.assertEqual({key: value["num_pending"] for key, value in summary.items()},
+                                 {key: len(samples) for key, samples in self.samples.items()})
+            if dataset == "emotion6" and label == "Fear":
+                raise deepseek.APIError("Simulated failure")
+            self.assertNotEqual(dataset, "emo8", "Stop before submitting a later dataset after failure")
+            return completion(formatted_answer(label))
+
+        with patch.object(deepseek, "request_completion", side_effect=reply) as request:
+            self.assertEqual(self.run_main(), 1)
+        self.assertEqual(request.call_count, 6)
+        summary = self.read_json("summary.json")
+        self.assertEqual(set(summary), set(self.samples))
+        self.assertTrue(summary["emoset"]["complete"])
+        self.assertEqual(summary["emotion6"]["num_samples"], 2)
+        self.assertEqual(summary["emotion6"]["num_pending"], 4)
+        self.assertEqual(summary["emo8"]["num_samples"], 0)
+        self.assertEqual(summary["emo8"]["num_pending"], 24)
+        self.assertFalse(summary["emo8"]["complete"])
+        saved = (self.output_dir / "emoset" / "predictions.jsonl").read_bytes()
+        with patch.object(deepseek, "request_completion", side_effect=self.reply) as request:
+            self.assertEqual(self.run_main("--resume"), 0)
+        requested = [self.request_sample(call.args[2]) for call in request.call_args_list]
+        self.assertEqual(len(requested), 28)
+        self.assertFalse(any(dataset == "emoset" for dataset, _, _ in requested))
+        self.assertEqual((self.output_dir / "emoset" / "predictions.jsonl").read_bytes(), saved)
+        self.assertTrue(all(metrics["complete"] for metrics in self.read_json("summary.json").values()))
+
+    def test_dry_run_checks_all_datasets_without_a_key_writes_or_network(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}), \
+                patch.object(deepseek, "request_completion") as request:
+            self.assertEqual(self.run_main("--dry-run"), 0)
+        request.assert_not_called()
+        self.network.assert_not_called()
+        self.assertFalse(self.output_dir.exists())
+        self.assertIn("33 images", self.stdout.getvalue())
+        for dataset in self.samples:
+            self.assertIn(dataset, self.stdout.getvalue())
+
+    def test_all_alias_selects_every_dataset_and_cannot_be_mixed_with_a_dataset_name(self):
+        with patch.object(deepseek, "request_completion") as request:
+            self.assertEqual(self.run_main("--datasets", "all", "--dry-run"), 0)
+            with self.assertRaises(SystemExit) as caught:
+                self.run_main("--datasets", "all", "emoset", "--dry-run")
+        self.assertEqual(caught.exception.code, 2)
+        request.assert_not_called()
+        self.assertIn("33 images", self.stdout.getvalue())
+        self.assertFalse(self.output_dir.exists())
+
+    def test_corrupt_image_in_last_dataset_prevents_all_requests_and_output_writes(self):
+        self.samples["emo8"][-1][2].write_bytes(b"not an image")
+        with patch.object(deepseek, "request_completion") as request:
+            with self.assertRaises((OSError, ValueError)):
+                self.run_main()
+        request.assert_not_called()
+        self.assertFalse(self.output_dir.exists())
+
+    def test_last_dataset_existing_results_are_rejected_before_initializing_earlier_datasets(self):
+        with patch.object(deepseek, "request_completion", side_effect=self.reply):
+            self.assertEqual(self.run_main("--datasets", "emo8"), 0)
+        original = self.snapshot()
+        with patch.object(deepseek, "request_completion") as request:
+            with self.assertRaisesRegex(ValueError, "Results already exist"):
+                self.run_main()
+        request.assert_not_called()
+        self.assertEqual(self.snapshot(), original)
+        self.assertFalse((self.output_dir / "emoset").exists())
+        self.assertFalse((self.output_dir / "emotion6").exists())
+
+    def test_last_dataset_resume_config_conflict_is_rejected_before_first_api_request(self):
+        with patch.object(deepseek, "request_completion", side_effect=self.reply):
+            self.assertEqual(self.run_main("--datasets", "emo8"), 0)
+        path = self.output_dir / "emo8" / "config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["model"] = "incompatible-saved-model"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        original = self.snapshot()
+        with patch.object(deepseek, "request_completion") as request:
+            with self.assertRaisesRegex(ValueError, "changed settings/data"):
+                self.run_main("--resume")
+        request.assert_not_called()
+        self.assertEqual(self.snapshot(), original)
+        self.assertFalse((self.output_dir / "emoset").exists())
+        self.assertFalse((self.output_dir / "emotion6").exists())
+
+    def test_limit_is_per_dataset_and_oversized_later_selection_fails_before_requests(self):
+        with patch.object(deepseek, "request_completion", side_effect=self.reply) as request:
+            self.assertEqual(self.run_main("--limit", "2"), 0)
+        self.assertEqual(request.call_count, 6)
+        self.assertEqual({dataset: metrics["num_selected"]
+                          for dataset, metrics in self.read_json("summary.json").items()},
+                         {dataset: 2 for dataset in self.samples})
+        other_output = self.root / "oversized"
+        with patch.object(deepseek, "request_completion") as request:
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                self.run_main("--datasets", "emotion6", "emoset", "--limit", "4",
+                              "--output-dir", str(other_output))
+        request.assert_not_called()
+        self.assertFalse(other_output.exists())
+
+    def test_explicit_emoset_subset_uses_new_dataset_subdirectory_layout(self):
+        test_list = self.root / "emoset_subset.json"
+        test_list.write_text(json.dumps(self.emoset_rows[1:2]), encoding="utf-8")
+        with patch.object(deepseek, "request_completion", side_effect=self.reply) as request:
+            self.assertEqual(self.run_main("--datasets", "emoset", "--test-list", str(test_list)), 0)
+        request.assert_called_once()
+        self.assertEqual(set(self.read_json("summary.json")), {"emoset"})
+        self.assertEqual(self.read_json("config.json", "emoset")["split"], "official_test_subset")
+        self.assertEqual([row["sample_id"] for row in self.read_records("emoset")], [self.emoset_rows[1][1]])
+        self.assertFalse((self.output_dir / "predictions.jsonl").exists())
+
+    def test_emotion6_optional_list_keeps_directory_labels_and_subset_scope(self):
+        test_list = self.root / "emotion6_subset.txt"
+        test_list.write_text("joy/same.png\nsurprise/same.png\n", encoding="utf-8")
+        with patch.object(deepseek, "request_completion", side_effect=self.reply) as request:
+            self.assertEqual(self.run_main("--datasets", "emotion6", "--emotion6-test-list", str(test_list)), 0)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual([row["label"] for row in self.read_records("emotion6")], ["Joy", "Surprise"])
+        self.assertEqual(self.read_json("config.json", "emotion6")["split"], "custom_test_list")
+
+    def test_full_emoset_selection_has_no_implicit_2000_image_cap(self):
+        # Distinct paths with identical tiny pixels keep the >2k regression fixture inexpensive.
+        source = self.samples["emoset"][0][2]
+        for index in range(3, 2001):
+            sample_id = f"images/{index}.png"
+            annotation = f"annotation/{index}.json"
+            (self.data_root / "EMOSET" / sample_id).hardlink_to(source)
+            (self.data_root / "EMOSET" / annotation).write_text(
+                json.dumps({"emotion": "anger"}), encoding="utf-8"
+            )
+            self.emoset_rows.append(["anger", sample_id, annotation])
+        self.write_emoset_rows()
+        with patch.object(deepseek, "request_completion") as request:
+            self.assertEqual(self.run_main("--datasets", "emoset", "--dry-run"), 0)
+        request.assert_not_called()
+        self.assertIn('"selected": 2001', self.stdout.getvalue())
+        self.assertFalse(self.output_dir.exists())
 
 
 class DeepSeekHTTPTests(unittest.TestCase):

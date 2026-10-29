@@ -85,10 +85,10 @@ class GrpoLauncherTests(unittest.TestCase):
         self.assertEqual(int(overrides["data.train_batch_size"]) * rollout_n, responses)
         self.assertEqual(2000 % prompts, 0)
 
-    def test_defaults_preserve_batch16_and_two_accumulation_steps(self):
+    def test_defaults_preserve_batch16_and_one_accumulation_step(self):
         result, calls = self.run_launcher()
         overrides = self.training_overrides(result, calls)
-        self.assert_batch_shape(overrides, batch=16, accumulation=2, gpu_count=2)
+        self.assert_batch_shape(overrides, batch=16, accumulation=1, gpu_count=2)
         self.assertTrue(overrides["actor_rollout_ref.model.path"].endswith("/model with spaces"))
         self.assertTrue(overrides["data_dir"].endswith("/data with spaces"))
 
@@ -117,7 +117,7 @@ class GrpoLauncherTests(unittest.TestCase):
             "trainer.experiment_name=trial with spaces",
         )
         overrides = self.training_overrides(result, calls)
-        self.assert_batch_shape(overrides, batch=16, accumulation=2, gpu_count=2)
+        self.assert_batch_shape(overrides, batch=16, accumulation=1, gpu_count=2)
         self.assertEqual(overrides["actor_rollout_ref.actor.optim.lr"], "5e-7")
         self.assertEqual(overrides["trainer.total_epochs"], "3")
         self.assertEqual(overrides["trainer.experiment_name"], "trial with spaces")
@@ -131,6 +131,7 @@ class GrpoLauncherTests(unittest.TestCase):
                 if mode == "--check":
                     self.assertEqual(overrides["dry_run"], "true")
                 else:
+                    self.assertEqual(overrides["trainer.resume_mode"], "disable")
                     self.assertEqual(overrides["trainer.total_training_steps"], "1")
                     self.assertEqual(overrides["trainer.val_before_train"], "false")
 

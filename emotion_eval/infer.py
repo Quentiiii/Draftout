@@ -10,8 +10,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .data import LABELS, Sample, load_emo8, load_emotion6, load_emoset
-from .metrics import classification_metrics, parse_prediction
-from .prompts import EMOTION_PROMPT
+from .metrics import (
+    classification_metrics, parse_angles_prediction, parse_angles_response,
+    parse_draft_prediction, parse_draft_response, parse_prediction,
+)
+from .prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_ANGLES_PROMPT
+from .sampling import PresencePenaltyLogitsProcessor, batch_seed, build_decoding_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = Path("/data/xiyan.zhao/work/model/Qwen3.5-2B")
@@ -97,6 +101,7 @@ class QwenPredictor:
 
         self.torch = torch
         self.args = args
+        self.decoding = build_decoding_config(args)
         if args.device == "auto":
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
         else:
@@ -125,9 +130,14 @@ class QwenPredictor:
             attn_implementation="sdpa",
             local_files_only=True,
         ).eval()
+        generation_kwargs = {"do_sample": args.do_sample, "repetition_penalty": args.repetition_penalty}
+        if args.do_sample:
+            generation_kwargs.update({key: getattr(args, key) for key in (
+                "temperature", "top_p", "top_k", "min_p",
+            )})
         self.generation_config = GenerationConfig(
             max_new_tokens=args.max_new_tokens,
-            do_sample=False,
+            **generation_kwargs,
             num_beams=1,
             use_cache=True,
             eos_token_id=self.model.generation_config.eos_token_id,
@@ -157,8 +167,17 @@ class QwenPredictor:
                 return_tensors="pt",
                 size={"shortest_edge": self.args.min_pixels, "longest_edge": self.args.max_pixels},
             ).to(self.model.device)
+            prompt_length = inputs["input_ids"].shape[1]
+            processors = []
+            if self.args.presence_penalty:
+                processors.append(PresencePenaltyLogitsProcessor(self.args.presence_penalty, prompt_length))
+            if self.args.do_sample:
+                # Derive a fresh seed from the original complete batch. Resuming
+                # earlier batches or changing model load order cannot shift it.
+                self.torch.manual_seed(batch_seed(self.args.seed, samples))
             with self.torch.inference_mode():
-                outputs = self.model.generate(**inputs, generation_config=self.generation_config)
+                outputs = self.model.generate(**inputs, generation_config=self.generation_config,
+                                              logits_processor=processors)
             # Slice by the padded input width, so the prompt never enters scoring.
             generated = outputs[:, inputs["input_ids"].shape[1]:]
             return self.processor.batch_decode(generated, skip_special_tokens=True,
@@ -174,8 +193,10 @@ def prepare_run(args: argparse.Namespace, dataset: str, samples: list[Sample], s
     directory.mkdir(parents=True, exist_ok=True)
     config_path = directory / "config.json"
     predictions_path = directory / "predictions.jsonl"
+    decoding = build_decoding_config(args)
+    angles = getattr(args, "prompt_style", "draft") == "angles"
     config = {
-        "format_version": 1,
+        "format_version": 4 if angles else (3 if len(decoding) > 1 else 2),
         "dataset": dataset,
         "split": split,
         "num_samples": len(samples),
@@ -184,7 +205,8 @@ def prepare_run(args: argparse.Namespace, dataset: str, samples: list[Sample], s
         "prompt": prompt,
         "labels": list(LABELS[dataset]),
         "enable_thinking": False,
-        "do_sample": False,
+        "response_format": "angles_then_analysis_then_boxed_label" if angles else "draft_then_boxed_label",
+        **decoding,
         "max_new_tokens": args.max_new_tokens,
         "min_pixels": args.min_pixels,
         "max_pixels": args.max_pixels,
@@ -192,6 +214,10 @@ def prepare_run(args: argparse.Namespace, dataset: str, samples: list[Sample], s
         "device": args.device,
         "batch_size": args.batch_size,
     }
+    if angles:
+        config["prompt_style"] = "angles"
+    if getattr(args, "num_shards", 1) > 1:
+        config.update(num_shards=args.num_shards, shard_index=getattr(args, "shard_index", 0))
     if not args.resume:
         # Reset only this dataset's generated artifacts, never its whole directory.
         predictions_path.write_text("", encoding="utf-8")
@@ -212,7 +238,10 @@ def prepare_run(args: argparse.Namespace, dataset: str, samples: list[Sample], s
                 "remove --resume to start over, or use a new --output-dir."
             )
         write_json(config_path, config)
-    records = read_predictions(predictions_path, samples, LABELS[dataset]) if args.resume else []
+    records = read_predictions(
+        predictions_path, samples, LABELS[dataset],
+        prediction_parser=parse_angles_prediction if angles else parse_draft_prediction,
+    ) if args.resume else []
     seen = {record["sample_id"] for record in records}
     return {"directory": directory, "records": records, "pending": [s for s in samples if s.sample_id not in seen]}
 
@@ -226,6 +255,10 @@ def argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--emotion6-test-list", type=Path, help="Optional list of paths like anger/1.jpg")
     parser.add_argument(
+        "--prompt-style", choices=("draft", "angles"), default="draft",
+        help="draft: explanation inside draft; angles: draft outline, separate analysis, then boxed answer",
+    )
+    parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "qwen35_emotion",
         help="Output directory; selected dataset results are overwritten unless --resume is used",
     )
@@ -234,10 +267,25 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size", "--batch_size", type=int, default=1, help="Number of images per generation batch"
     )
-    parser.add_argument("--max-new-tokens", type=int, default=16, help="Maximum generated tokens per image")
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=512, help="Output budget for explanation and boxed answer per image"
+    )
     parser.add_argument("--min-pixels", type=int, default=65536, help="Minimum resized image area")
     parser.add_argument("--max-pixels", type=int, default=1048576, help="Maximum resized image area")
+    parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable random sampling instead of greedy decoding")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (>0)")
+    parser.add_argument("--top-p", type=float, default=0.8, help="Sampling nucleus probability")
+    parser.add_argument("--top-k", type=int, default=20, help="Sampling top-k cutoff; 0 disables it")
+    parser.add_argument("--min-p", type=float, default=0.0, help="Sampling relative probability cutoff")
+    parser.add_argument("--presence-penalty", type=float, default=0.0,
+                        help="Subtract this logit penalty once per token already generated; excludes prompt")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Transformers multiplicative repetition penalty; 1 disables it")
+    parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic original-batch sampling")
     parser.add_argument("--limit", type=int, help="Take first N samples per dataset for a smoke test")
+    parser.add_argument("--num-shards", type=int, default=1, help="Number of interleaved dataset shards")
+    parser.add_argument("--shard-index", type=int, default=0, help="Zero-based shard to evaluate; use a separate output directory")
     parser.add_argument("--resume", action="store_true", help="Resume a matching run from saved JSONL records")
     parser.add_argument(
         "--dry-run", action="store_true", help="Check all selected paths/labels without loading the model"
@@ -248,21 +296,28 @@ def argument_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = argument_parser()
     args = parser.parse_args(argv)
-    for key in ("batch_size", "max_new_tokens", "min_pixels", "max_pixels", "limit"):
+    for key in ("batch_size", "max_new_tokens", "min_pixels", "max_pixels", "limit", "num_shards"):
         value = getattr(args, key)
         if value is not None and value < 1:
             parser.error(f"--{key.replace('_', '-')} must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        parser.error("Require 0 <= --shard-index < --num-shards")
     if args.min_pixels > args.max_pixels or args.min_pixels < 1024:
         parser.error("Require 1024 <= --min-pixels <= --max-pixels")
     if len(set(args.datasets)) != len(args.datasets):
         parser.error("--datasets must not contain duplicates")
+    try:
+        build_decoding_config(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.model = args.model.expanduser().resolve()
     args.data_root = args.data_root.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     if not args.model.is_dir():
         parser.error(f"Model directory does not exist: {args.model}")
+    template = EMOTION_ANALYSIS_ANGLES_PROMPT if args.prompt_style == "angles" else DEEPSEEK_EMOTION_PROMPT
     prompts = {
-        dataset: EMOTION_PROMPT.format(labels=", ".join(LABELS[dataset]))
+        dataset: template.format(labels=", ".join(LABELS[dataset]))
         for dataset in args.datasets
     }
 
@@ -280,8 +335,9 @@ def main(argv: list[str] | None = None) -> int:
         total = len(samples)
         if args.limit:
             samples = samples[:args.limit]
+        samples = samples[args.shard_index::args.num_shards]
         if not samples:
-            raise ValueError(f"No images selected for {dataset}")
+            raise ValueError(f"No images selected for {dataset} (shard {args.shard_index}/{args.num_shards})")
         print(json.dumps({"dataset": dataset, "split": split, "available": total, "selected": len(samples),
                           "class_counts": dict(Counter(s.label for s in samples))}, ensure_ascii=False), flush=True)
         datasets[dataset] = (samples, split)
@@ -315,21 +371,38 @@ def main(argv: list[str] | None = None) -> int:
                 postfix={"accuracy": f"{num_correct / len(records):.4f}" if records else "N/A"},
             ) as progress,
         ):
-            for offset in range(0, len(pending), args.batch_size):
-                batch = pending[offset:offset + args.batch_size]
+            seen = {record["sample_id"] for record in records}
+            # Keep original batch membership on resume, including a batch whose
+            # JSONL append was interrupted. Re-generate it and append only missing
+            # records, preserving the batch seed and padding seen by the model.
+            for offset in range(0, len(samples), args.batch_size):
+                batch = samples[offset:offset + args.batch_size]
+                if all(sample.sample_id in seen for sample in batch):
+                    continue
                 raw_outputs = predictor.predict(batch, prompt=prompts[dataset])
                 if len(raw_outputs) != len(batch):
                     raise RuntimeError("The model did not return exactly one answer per image")
+                added = 0
                 for sample, raw in zip(batch, raw_outputs, strict=True):
-                    prediction = parse_prediction(raw, labels)
+                    if sample.sample_id in seen:
+                        continue
+                    if args.prompt_style == "angles":
+                        draft, analysis, prediction = parse_angles_response(raw, labels)
+                    else:
+                        draft, prediction = parse_draft_response(raw, labels)
                     record = {"dataset": dataset, "sample_id": sample.sample_id,
                               "image_path": str(sample.image_path), "label": sample.label,
-                              "prediction": prediction, "raw_output": raw, "correct": prediction == sample.label}
+                              "prediction": prediction, "draft": draft, "raw_output": raw,
+                              "correct": prediction == sample.label}
+                    if args.prompt_style == "angles":
+                        record["analysis"] = analysis
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                     records.append(record)
+                    seen.add(sample.sample_id)
+                    added += 1
                     num_correct += record["correct"]
                 progress.set_postfix(accuracy=f"{num_correct / len(records):.4f}", refresh=False)
-                progress.update(len(batch))
+                progress.update(added)
         metrics = {"dataset": dataset, "split": split, **classification_metrics(records, labels)}
         write_json(run["directory"] / "metrics.json", metrics)
         summary[dataset] = metrics

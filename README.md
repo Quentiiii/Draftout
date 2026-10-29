@@ -72,8 +72,8 @@ PyTorch 2.10.0、Transformers 5.5.0、torchvision 0.25.0、Pillow 12.0.0、Accel
 可用 `PYTHON_BIN=/path/to/python` 覆盖解释器。模型和处理器均只从本地加载。
 
 在启动脚本中修改 `model_path` 可以选择模型，默认是
-`/data/xiyan.zhao/work/model/Qwen3.5-2B`；运行 4B 时改为
-`/data/xiyan.zhao/work/model/Qwen3.5-4B`。也可用命令行 `--model` 覆盖，例如：
+`/data/xiyan.zhao/work/model/Qwen3.5-4B`；运行 2B 时改为
+`/data/xiyan.zhao/work/model/Qwen3.5-2B`。也可用 `MODEL_PATH` 环境变量或命令行 `--model` 覆盖，例如：
 
 ```bash
 bash scripts/run_emotion_baseline.sh \
@@ -111,11 +111,33 @@ bash scripts/run_emotion_baseline.sh --batch-size 8 --output-dir outputs/emotion
 也可在启动命令前设置环境变量覆盖。`--device cuda:0` 表示可见 GPU 中的第一张；
 例如 `CUDA_VISIBLE_DEVICES=1` 时，`cuda:0` 对应物理 GPU 1。
 
-分类提示词独立保存在 `emotion_eval/prompts.py` 的 `EMOTION_PROMPT` 字符串中，可直接修改。
+Baseline 与 DeepSeek 共用 `emotion_eval/prompts.py` 中的 `DEEPSEEK_EMOTION_PROMPT`，可直接修改。
+模型先在 `<draft>...</draft>` 中用 2–4 句话解释图像依据，再以 `\boxed{类别}` 给出最终答案。
+三个数据集使用同一模板，各自填入对应的候选类别；EmoSet 的提示词与 DeepSeek 完全一致。
 `{labels}` 是唯一会被自动替换的占位符，请保留它；程序按当前数据集填入合法类别列表。
+模板中的 `\boxed{{LABEL}}` 使用双大括号转义，填入类别列表后变为 `\boxed{LABEL}`。
 推理代码导入该字符串，填入类别后作为 `prompt` 参数传给 `predictor.predict()`。
 修改提示词后直接运行会从头覆盖旧结果；如需保留旧结果，请使用新的 `--output-dir`。
-`--resume` 要求提示词与原运行一致。
+`--resume` 要求提示词与原运行一致，不能续跑旧版仅输出标签的实验。
+新实验可运行 `bash scripts/run_emotion_baseline.sh --output-dir outputs/qwen35_emotion_draft_sampled`。
+
+启动脚本默认采用非 thinking 图像任务的采样参数：`do_sample=true`、`temperature=0.7`、
+`top_p=0.8`、`top_k=20`、`min_p=0`、`presence_penalty=1.5`、`repetition_penalty=1`，基础 seed 为 42。
+Transformers 5.5 没有原生 presence penalty；本项目用 logits processor 对已生成 token 一次性扣分，
+不惩罚提示词中的 token。参数可通过同名命令行选项覆盖，例如 `--temperature 0.7 --seed 42`。
+直接运行 Python 入口仍默认贪心；启动脚本恢复旧贪心行为需要同时传 `--no-do-sample --presence-penalty 0`。
+
+只用物理 GPU 0、3，依次运行 2B 和 4B 的三数据集采样基线：
+
+```bash
+bash scripts/run_emotion_sampling_baselines.sh
+```
+
+该脚本每个模型分成两份在双卡上并行，batch 为每卡 64，输出分别是
+`outputs/qwen35_2b_emotion_draft_sampled_seed42` 和 `outputs/qwen35_4b_emotion_draft_sampled_seed42`。
+可添加 `2B` 或 `4B` 仅运行一个模型；默认使用 `--resume`，聚合前验证完整样本覆盖。
+采样结果保存版本 3 的完整解码配置；随机种子由基础 seed 和原始 batch 样本 ID 派生。
+中断续跑保持原始 batch，部分写入的 batch 会重算后仅补写缺失记录；更改 batch、seed 或采样参数会拒绝续跑。
 
 ```bash
 cd /data/xiyan.zhao/work/Draftout
@@ -155,21 +177,24 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 bash scripts/run_emotion_baseline.sh \
 推理时每个数据集显示一个 `tqdm` 进度条，包含已完成图片数、总图片数、处理速度、
 预计剩余时间和累计准确率。每完成一批图片后刷新；使用 `--resume` 时从已保存的数量继续显示。
 
-默认输出目录是项目下的 `outputs/qwen35_emotion/`，每个数据集分别保存：
+启动脚本默认输出目录是 `outputs/qwen35_emotion_draft_sampled/`（可用 `OUTPUT_DIR` 覆盖）；
+直接运行 Python 入口仍默认 `outputs/qwen35_emotion/`。每个数据集分别保存：
 
-- `predictions.jsonl`：逐图路径、真值、预测类别、原始模型输出和是否正确，每条立即写出。
+- `predictions.jsonl`：逐图路径、真值、预测类别、单独的 `draft` 解释、完整 `raw_output` 和是否正确，每条立即写出。
 - `metrics.json`：Accuracy、Macro-F1、每类 precision/recall/F1/support、混淆矩阵。
 - `config.json`：模型路径、提示词、推理参数及样本清单摘要，用于核对断点续跑。
 
-所选数据集完成后额外写出 `summary.json`。指标范围为 0–1；无法解析为单个合法类别的
-输出记为 `prediction: null` 并计错，不从分母剔除。Macro-F1 始终覆盖数据集全部类别，
+所选数据集完成后额外写出 `summary.json`。指标范围为 0–1；评分只读取解释之后的唯一
+`\boxed{合法类别}`，解释中提及的情绪不参与评分。缺少非空 `<draft>...</draft>`、答案框不完整、
+多个最终答案或格式之外有额外文字的输出记为 `prediction: null` 并计错，不从分母剔除。
+Macro-F1 始终覆盖数据集全部类别，
 无样本类别记为 0，所以 `--limit` 仅适合验证流程，不能当作完整测试指标。
 混淆矩阵行为真值、列为预测，最后一列是无效输出。
 
 直接运行 Python 入口时，`--batch-size` 默认为 1；启动脚本使用其 `batch_size` 变量（当前为 `64`）。
 `--max-pixels` 默认为 1,048,576，
 `--min-pixels` 默认为 65,536，均指缩放后的图片像素面积。
-`--max-new-tokens` 默认为 16。完整参数见 `bash scripts/run_emotion_baseline.sh --help`。
+`--max-new-tokens` 默认为 512，覆盖解释与最终答案。完整参数见 `bash scripts/run_emotion_baseline.sh --help`。
 如另有 Emotion6 测试划分，可传 `--emotion6-test-list /path/to/test.txt`，
 每行是相对 `images/` 的路径，例如 `anger/1.jpg`。
 
@@ -185,15 +210,33 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 bash scripts/run_emotion_baseline.sh \
 python -m unittest discover -s tests -v
 ```
 
-## DeepSeek-V4.1-Flash：EmoSet 测试集 2,000 张
+## DeepSeek-V4.1-Flash：三个数据集全量评估
 
-入口为 `scripts/run_deepseek_emoset.sh`，Python 模块为 `emotion_eval.deepseek`。
+入口为 `scripts/run_deepseek_emotion.sh`，Python 模块为 `emotion_eval.deepseek`。
+默认评估三个数据集，共 **28,626** 张，与上方本地 baseline 的评估范围一致：
+
+| 数据集 | 默认范围 | 真值来源 |
+| --- | --- | --- |
+| EmoSet | 官方 `test.json`，17,716 张，split 为 `official_test` | 每图 annotation 的 `emotion`，并核对测试清单类别 |
+| Emotion6 | `Emotion6/Emotion6/images/` 全部 1,980 张 | 六个类别目录名：`anger, disgust, fear, joy, sadness, surprise` |
+| EMO8 | train 7,141 + val 889 + test 900，共 8,930 张 | 类别目录名，`sad` 映射为 `Sadness` |
+
+Emotion6 为与现有 baseline 对比，继续沿用目录标签，不使用 `ground_truth.txt` 中的人工情绪分布；
+本地没有独立测试划分，结果标记为全量评估。如需指定测试划分，可传
+`--emotion6-test-list /path/to/test.txt`，每行是相对 `images/` 的路径，例如 `anger/1.jpg`。
+EMO8 的 split 为 `all_train_val_test_as_test`，样本 ID 保留 `train/`、`val/`、`test/` 前缀。
+这些图片全部只用于推理。
+
+旧入口 `scripts/run_deepseek_emoset.sh` 保留为兼容入口，转调新脚本；
+**旧入口无参运行也会评估三个数据集全量，不再默认使用 EmoSet 2k 子集。**
+只运行 EmoSet 官方测试集时，显式传入 `--datasets emoset`；旧 2k 实验的运行方式见本节末尾。
+
 模型参数默认使用官方 API 名称 `deepseek-flash`，对应 V4.1-Flash 系列；
 这是服务端维护的别名，实际返回的模型名称会随结果保存。
 模型名称参考 [DeepSeek 官方发布说明](https://api-docs.deepseek.com/news/news260910/)，
 图像请求格式参考 [Vision 文档](https://api-docs.deepseek.com/guides/vision/)。
-脚本设置 `temperature=0`，使用 `emotion_eval/prompts.py` 中的 `DEEPSEEK_EMOTION_PROMPT`：
-先用 2–4 句话解释图片中的视觉依据，将解释放在 `<draft>...</draft>` 内，
+脚本设置 `temperature=0`，使用 `emotion_eval/prompts.py` 中的 `DEEPSEEK_EMOTION_PROMPT`，
+按当前数据集填入候选类别。先用 2–4 句话解释图片中的视觉依据，将解释放在 `<draft>...</draft>` 内，
 然后以 `\boxed{类别}` 给出唯一答案，例如：
 
 ```text
@@ -207,13 +250,6 @@ The dark, threatening scene and tense posture convey a sense of danger.
 相关参数见 [Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode/)。
 评分仅使用 `</draft>` 后的唯一 `\boxed{}` 类别，解释中提到的其他情绪不参与评分。
 
-默认使用项目中的 `splits/emoset_test_2000.json`，从此前
-`Qwen3-VL/splits/emoset_test_2000.json` 原样复制，保持实验样本一致。
-该清单来自官方 `test.json` 的 17,716 张测试图片，按原始类别比例分层抽样，
-seed 为 `20260612`，包含 2,000 张互不重复的图片，不包含训练样本。
-运行时检查清单属于官方测试集、图片与 annotation 存在、annotation 的 emotion 与清单一致。
-这里的测试子集与下方 GRPO 训练用的 2,000 张样本相互独立。
-
 依赖仅为 **Python 3.10+ 和 Pillow**，无需本地模型或 GPU。
 启动脚本默认使用已有的 `vision-opd` Python，可通过 `PYTHON_BIN=/path/to/python` 覆盖。
 API key 通过环境变量 `DEEPSEEK_API_KEY`，或启动脚本读取的项目根目录 `.deepseek.env` 提供；
@@ -224,33 +260,53 @@ cd /data/xiyan.zhao/work/Draftout
 cp .deepseek.env.example .deepseek.env
 # 编辑 .deepseek.env，填入自己的 DEEPSEEK_API_KEY。
 
-# 不需要 API key：校验数据与图片解码，不请求 API、不写输出文件。
-bash scripts/run_deepseek_emoset.sh --dry-run
+# 不需要 API key：校验三个数据集的标签与全部图片解码，不请求 API、不写输出文件。
+bash scripts/run_deepseek_emotion.sh --dry-run
 
-# 填好 key 后，先用清单前 2 张检查真实 API；结果放在独立目录。
-bash scripts/run_deepseek_emoset.sh \
-  --limit 2 --output-dir outputs/deepseek_emoset_smoke
+# 填好 key 后，每个数据集前 2 张检查真实 API，共 6 张；结果放在独立目录。
+bash scripts/run_deepseek_emotion.sh \
+  --limit 2 --output-dir outputs/deepseek_emotion_smoke
 
-# 完整运行清单中的 2,000 张。
-bash scripts/run_deepseek_emoset.sh
+# 三个数据集全量，共 28,626 张。
+bash scripts/run_deepseek_emotion.sh
+
+# 只评估 EmoSet 官方测试集，17,716 张。
+bash scripts/run_deepseek_emotion.sh --datasets emoset
+
+# 也可指定任意组合。
+bash scripts/run_deepseek_emotion.sh --datasets emotion6 emo8
 
 # 中断或 API 错误后，在同一输出目录继续。
-bash scripts/run_deepseek_emoset.sh --resume
+bash scripts/run_deepseek_emotion.sh --resume
 ```
 
-仅有 API key 配置不会自动发起请求；执行非 `--dry-run` 命令才会调用 API。
-若使用其他 Python，可先执行 `/path/to/python -m pip install Pillow`，再运行
-`PYTHON_BIN=/path/to/python bash scripts/run_deepseek_emoset.sh`。
-也可在项目根目录直接执行 `python -m emotion_eval.deepseek`，此时自行设置环境变量
-`DEEPSEEK_API_KEY`，不会通过启动脚本加载 `.deepseek.env`。
+在 `scripts/run_deepseek_emotion.sh` 顶部可直接修改这些变量；同名命令行参数可覆盖脚本设置：
 
-常用参数如下，完整选项见 `bash scripts/run_deepseek_emoset.sh --help`：
+```bash
+datasets=(emoset emotion6 emo8)
+workers=4
+model_name="deepseek-flash"
+max_tokens=512
+max_image_side=1024
+output_dir="outputs/deepseek_v41_flash_emotion"
+```
+
+例如 `datasets=(emotion6)` 只运行 Emotion6，`--workers 8` 调整并发数，
+`--model` 对应脚本变量 `model_name`。仅有 API key 配置不会自动发起请求；
+执行非 `--dry-run` 命令才会调用 API。
+若使用其他 Python，可先执行 `/path/to/python -m pip install Pillow`，再运行
+`PYTHON_BIN=/path/to/python bash scripts/run_deepseek_emotion.sh`。
+也可在项目根目录直接执行 `python -m emotion_eval.deepseek`，默认同样评估三个数据集全量；
+此时自行设置环境变量 `DEEPSEEK_API_KEY`，不会通过启动脚本加载 `.deepseek.env`。
+
+常用参数如下，完整选项见 `bash scripts/run_deepseek_emotion.sh --help`：
 
 | 参数 | 默认值与用途 |
 | --- | --- |
-| `--data-root` | `/data/xiyan.zhao/work/dataset/EMOSET`，直接指向含 `test.json` 的目录 |
-| `--test-list` | 项目内 `splits/emoset_test_2000.json`，可指定相同三列格式的测试子集清单 |
-| `--limit` | 默认不截断；指定时仅运行清单前 N 张，用于检查流程 |
+| `--datasets` | 默认全部；可传 `all`，或 `emoset emotion6 emo8` 的任意组合 |
+| `--data-root` | `/data/xiyan.zhao/work/dataset`，包含 `EMOSET/`、`Emotion6/`、`EMO8/` 的父目录 |
+| `--emotion6-test-list` | 默认不用独立清单；可指定相对 Emotion6 `images/` 的逐行路径清单 |
+| `--limit` | 默认不截断；指定时每个所选数据集仅运行前 N 张，用于检查流程 |
 | `--workers` | `4`，并发请求数 |
 | `--model` | `deepseek-flash` |
 | `--base-url` | `https://api.deepseek.com` |
@@ -258,12 +314,15 @@ bash scripts/run_deepseek_emoset.sh --resume
 | `--max-image-side` | `1024`，发送图片的最长边上限 |
 | `--timeout` | `120`，单次请求超时秒数 |
 | `--max-retries` | `3`，可重试错误的最大重试次数 |
+| `--output-dir` | `outputs/deepseek_v41_flash_emotion`，各数据集输出目录的父目录 |
+| `--resume` | 校验数据和配置后，跳过已有成功 API 响应，继续失败和未完成样本 |
+| `--dry-run` | 核对标签并解码全部选中图片，不请求 API、不写输出文件 |
 
 发送前按 EXIF 方向转正图片，只缩小、不放大，转换为 RGB JPEG，质量设为 95，
 移除图片元数据。通过 base64 发送图像内容，图片路径、文件名和真值标签不进入提示词。
-`--dry-run` 会核对标签并解码所有选中图片，适合在付费请求前检查数据完整性。
 
-默认输出目录为 `outputs/deepseek_v41_flash_emoset_2k/`：
+默认输出根目录为 `outputs/deepseek_v41_flash_emotion/`。
+每个数据集分别写入 `emoset/`、`emotion6/`、`emo8/` 子目录，包含：
 
 - `config.json`：模型、提示词、请求参数、图像处理参数和数据指纹。
 - `samples.json`：本次实际选择的样本清单。
@@ -271,26 +330,48 @@ bash scripts/run_deepseek_emoset.sh --resume
 - `errors.jsonl`：失败请求记录，便于排查和续跑。
 - `metrics.json`：完成状态、样本进度、Accuracy、Macro-F1、逐类指标、混淆矩阵和 token 使用量。
 
+输出根目录的 `summary.json` 按数据集名称映射本次 `--datasets` 所选数据集的 metrics。
+默认汇总三个数据集；单独运行某个数据集时，汇总仅包含该数据集，其他历史目录的结果仍保留。
 默认拒绝覆盖已有运行文件；重复实验使用新的 `--output-dir`，恢复已有实验使用 `--resume`。
-续跑会校验数据及配置，并跳过已保存的成功 API 响应；旧版仅输出标签的实验不能与新提示词续跑混用，
-可用 `--output-dir outputs/deepseek_v41_flash_emoset_2k_draft` 开始新实验。
+续跑会校验数据及配置，并跳过已保存的成功 API 响应；旧版仅输出标签的实验不能与新提示词续跑混用。
 成功返回但缺少非空 `<draft>...</draft>`、末尾唯一 `\boxed{合法类别}` 或含额外文字的输出
 计错且不自动重试，完整原始回答仍会保存。请求错误达到重试上限后，程序等待当前并发批次结束、
 保存已完成结果并退出；续跑会重新处理失败和未完成样本。
-网络失败保持待处理状态，不充当模型分类错误。`metrics.json` 的 `complete` 为 `true`
-时才是本次清单的完整评估，否则指标仅反映已完成部分；`--limit` 的小样本结果不代表 2,000 张性能。
+网络失败保持待处理状态，不充当模型分类错误。每个 `metrics.json` 的 `complete` 为 `true`
+时才是该数据集本次清单的完整评估，否则指标仅反映已完成部分；`--limit` 的小样本结果不代表全量性能。
+
+保留旧 EmoSet 2k 实验时，显式传 `--test-list`，且不传 `--datasets`，进入旧版单 EmoSet 模式。
+此时 `--data-root` 直接指向含 `test.json` 的 `EMOSET/` 目录，输出文件平铺在指定目录下，
+不会增加 `emoset/` 子目录。启动脚本同样支持此模式，并按上述方式加载 API key：
+
+```bash
+bash scripts/run_deepseek_emoset.sh \
+  --test-list splits/emoset_test_2000.json \
+  --data-root ../dataset/EMOSET \
+  --output-dir outputs/deepseek_v41_flash_emoset_2k \
+  --resume
+```
+
+去掉 `--resume` 并使用新的输出目录可从头运行；加 `--dry-run` 可只校验图片。
+`splits/emoset_test_2000.json` 从此前 `Qwen3-VL/splits/emoset_test_2000.json` 原样复制，
+从官方 17,716 张测试图片中按原始类别比例分层抽样，seed 为 `20260612`，
+包含 2,000 张互不重复的图片，不包含训练样本。运行时检查清单属于官方测试集，
+并核对图片、annotation 和类别。该旧测试子集与下方 GRPO 训练用的 2,000 张样本相互独立。
 
 ## EmoSet 2k 纯 GRPO 训练
 
 入口是 `scripts/run_emoset_grpo.sh`，默认直接调用已有的 `vision-opd` 解释器，
-使用本仓库 `verl` 和本地 `/data/xiyan.zhao/work/model/Qwen3.5-4B`。这里的纯 GRPO
+使用本仓库 `verl` 和本地 `/data/xiyan.zhao/work/model/Qwen3.5-2B`。这里的纯 GRPO
 使用组内均值、标准差归一化的 advantage 和 clipped policy loss，不启用 OPD、
 teacher、自蒸馏、critic、reward model、KL 或 entropy bonus。
 
-训练奖励只有正确性：正确类别得 **1**，错误、空回答、多个类别或无法解析的输出得 **0**。
-`emotion_grpo/reward.py` 复用现有评估的答案解析规则，忽略大小写，兼容简单引号、
-`<answer>` 包装和 thinking 后的最终答案；不额外加格式奖励。提示词也复用
-`emotion_eval/prompts.py`，默认关闭 thinking，最多生成 16 tokens。
+GRPO 与 baseline、DeepSeek 共用 `emotion_eval/prompts.py` 中的 `DEEPSEEK_EMOTION_PROMPT`：
+先在 `<draft>...</draft>` 中解释，再以 `\boxed{类别}` 给出最终答案。
+训练数据额外保留一个 `<image>` 占位符，用于 verl 加载图片，文本提示词与 EmoSet 评估一致。
+`emotion_grpo/reward.py` 复用相同的解析器：格式完整且最终 boxed 类别正确得 **1**；
+错误、空回答、格式不完整或多个最终答案得 **0**。类别忽略大小写，解释中提到的情绪不参与评分，
+不额外奖励解释内容或格式。默认关闭独立 thinking 模式，解释与答案一起生成，最多 **512 tokens**；
+`max_prompt_length=1024`，对应 `rollout.max_model_len=1536`。
 
 数据由 `emotion_grpo/prepare_data.py` 准备：
 
@@ -305,6 +386,11 @@ teacher、自蒸馏、critic、reward model、KL 或 entropy bonus。
 - 图片通过多模态字段传入，文件名和真值不进入模型文本；像素面积限制为
   65,536–262,144，patch size 为 16。
 
+若已有旧提示词的 parquet，需要重新生成；`--check` 会检查数据中保存的提示词。
+保留旧数据时可设置 `DATA_DIR=outputs/emoset_grpo/data_draft` 后运行启动脚本；
+也可显式执行 `python -m emotion_grpo.prepare_data --overwrite` 更新默认数据目录。
+新提示词实验使用新的 `trainer.experiment_name`，不要与旧提示词的 checkpoint 混合续训。
+
 ```bash
 cd /data/xiyan.zhao/work/Draftout
 
@@ -318,22 +404,28 @@ bash scripts/run_emoset_grpo.sh --check
 # GPU 单步验证训练链路，输出到独立的 emoset_grpo_2k_smoke 目录
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_emoset_grpo.sh --smoke
 
-# 正式训练；默认 GPU 0,1，1 epoch
+# 正式续训；默认 GPU 0,1，从最新 checkpoint 继续到累计 10 epochs
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_emoset_grpo.sh
 
 # 覆盖学习率、epochs；其余 Hydra 参数也可按相同方式追加
 bash scripts/run_emoset_grpo.sh \
   actor_rollout_ref.actor.optim.lr=5e-7 trainer.total_epochs=5
 
-# 显式断点续训；相同模型、数据和训练配置
-bash scripts/run_emoset_grpo.sh trainer.resume_mode=auto
+# 从头开始新实验，另选目录
+bash scripts/run_emoset_grpo.sh \
+  trainer.resume_mode=disable trainer.experiment_name=emoset_grpo_2k_new
 ```
+
+当前 `emoset_grpo_2k/global_step_250` 已完成 1 epoch，默认继续训练 9 epochs，
+直到总共 10 epochs / 2,500 steps（剩余 2,250 steps）。恢复的是原始训练 checkpoint，
+包含模型、优化器、学习率调度器、随机数与数据加载器状态，不使用合并后的推理模型。
+续训保持原来的模型、数据和 batch 设置；`trainer.total_epochs` 表示累计轮数。
 
 batch 和梯度累积在 `scripts/run_emoset_grpo.sh` 顶部集中设置：
 
 ```bash
 batch_size="${BATCH_SIZE:-16}"                              # 单卡一次前向/反向的回答数
-gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS:-2}"  # 累积次数，1 表示不累积
+gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS:-1}"  # 累积次数，1 表示不累积
 rollout_n="${ROLLOUT_N:-4}"                                 # 每图回答数
 ```
 
@@ -352,8 +444,8 @@ BATCH_SIZE=8 GRADIENT_ACCUMULATION_STEPS=4 bash scripts/run_emoset_grpo.sh --che
 
 脚本按 `每步图片数 = batch_size × gradient_accumulation_steps × GPU 数 / rollout_n`
 自动换算 `data.train_batch_size`、`ppo_mini_batch_size` 和 actor/log-prob 的单卡 micro batch，
-启动时打印最终数值。默认两卡、batch 16、累积 2 次，每步处理 16 张图 / 64 条回答，
-每卡各处理 32 条回答后完成一次参数更新。
+启动时打印最终数值。默认两卡、batch 16、累积 1 次，每步处理 8 张图 / 32 条回答，
+每卡各处理 16 条回答后完成一次参数更新。
 每步图片数必须为整数且能整除 2,000，否则提前报错，避免丢弃最后一批或改变累积次数。
 例如两卡下 `batch=16, accumulation=4` 得到每步 32 张图，不能整除 2,000；
 可用 `batch=8, accumulation=4` 保持每步 16 张图。
@@ -363,11 +455,12 @@ BATCH_SIZE=8 GRADIENT_ACCUMULATION_STEPS=4 bash scripts/run_emoset_grpo.sh --che
 `verl/trainer/config/emoset_grpo.yaml` 读取，并可用 Hydra 参数覆盖。
 学习率 `1e-6`，模型加载、训练前向和 vLLM rollout 均显式设为 BF16，使用 FSDP2。
 vLLM 使用 `temperature=1`，验证使用单回答贪心解码。
-默认每步 16 张图，每个 epoch 共 125 steps，训练 1 epoch；调整有效 batch 后 steps 相应变化。
+默认每步 8 张图，每个 epoch 共 250 steps，累计训练 10 epochs；调整有效 batch 后 steps 相应变化。
 每 25 steps 验证并保存，最多保留两个 actor checkpoint，日志默认输出到终端。
 checkpoint 默认写到 `outputs/emoset_grpo/checkpoints/emoset_grpo_2k/`，同时保存
-`resolved_config.yaml` 和验证回答。已有 checkpoint 时需要显式续训或换
-`trainer.experiment_name`，避免覆盖已有训练结果。
+`resolved_config.yaml` 和验证回答。默认 `trainer.resume_mode=auto` 从最新 checkpoint
+恢复；没有 checkpoint 时从头训练。新实验请更换 `trainer.experiment_name`。
+`--smoke` 关闭续训，在独立目录执行单步检查。
 
 启动脚本从 `CUDA_VISIBLE_DEVICES` 推导 GPU 数；也可覆盖 `PYTHON_BIN`、`MODEL_PATH`、
 `EMOSET_ROOT`、`DATA_DIR`。单卡可设置 `CUDA_VISIBLE_DEVICES=0`，实际能否容纳模型与

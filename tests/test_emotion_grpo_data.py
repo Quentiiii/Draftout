@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
+from emotion_eval.deepseek import PROMPT as DEEPSEEK_PROMPT
+from emotion_eval.prompts import EMOTION_PROMPT
 from emotion_grpo.prepare_data import (
     ARTIFACT_NAMES,
     EMOSET_LABELS,
@@ -68,6 +71,7 @@ class GrpoDataTests(unittest.TestCase):
             check_disjoint({"train": train, "val": read_split(self.root, "val"), "test": [train[-1]]})
 
     def test_schema_and_prompt_do_not_leak_per_example_information(self):
+        self.assertEqual(PROMPT, "<image>\n" + DEEPSEEK_PROMPT)
         self.write_split("train")
         selected = select_entries(read_split(self.root, "train"), 8, 42)
         rows, manifest = make_rows(self.root, "train", selected)
@@ -122,6 +126,28 @@ class GrpoDataTests(unittest.TestCase):
         self.assertEqual(hashes, {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES})
         metadata = prepare_dataset(**config, seed=43, overwrite=True)
         self.assertEqual(metadata["config"]["seed"], 43)
+
+    def test_old_prompt_artifacts_require_explicit_regeneration(self):
+        import pyarrow.parquet as pq
+
+        for split in ("train", "val", "test"):
+            self.write_split(split)
+        config = {"dataset_root": self.root, "output_dir": self.output, "train_size": 8, "val_size": 8}
+        old_prompt = "<image>\n" + EMOTION_PROMPT.format(labels=", ".join(EMOSET_LABELS))
+        with patch("emotion_grpo.prepare_data.PROMPT", old_prompt):
+            previous = prepare_dataset(**config)
+        hashes = {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES}
+        with self.assertRaises(FileExistsError):
+            prepare_dataset(**config)
+        self.assertEqual(hashes, {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES})
+
+        current = prepare_dataset(**config, overwrite=True)
+        self.assertEqual(current["prompt"], "<image>\n" + DEEPSEEK_PROMPT)
+        self.assertNotEqual(previous["prompt_sha256"], current["prompt_sha256"])
+        for split in ("train", "val"):
+            self.assertEqual(hashes[f"{split}_manifest.jsonl"], sha256_file(self.output / f"{split}_manifest.jsonl"))
+            for row in pq.read_table(self.output / f"{split}.parquet").to_pylist():
+                self.assertEqual(row["prompt"], [{"role": "user", "content": PROMPT}])
 
     def test_identical_train_val_image_bytes_are_rejected(self):
         for split in ("train", "val", "test"):

@@ -67,6 +67,7 @@ def check_config(config: DictConfig) -> None:
 def check_data(config: DictConfig) -> dict:
     """Exercise real parquet loading, image processing, templates and rewards."""
     from emotion_eval.data import LABELS
+    from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT
     from verl.trainer.ppo.reward import get_custom_reward_fn
     from verl.utils import hf_processor, hf_tokenizer
     from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -86,6 +87,7 @@ def check_data(config: DictConfig) -> dict:
         raise ValueError("A correctness reward function must be configured.")
 
     result = {"model": str(model_path), "splits": {}}
+    expected_prompt = DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(LABELS["emoset"]))
     split_ids = {}
     for split, paths in (("train", config.data.train_files), ("val", config.data.val_files)):
         dataset = RLHFDataset(paths, tokenizer, config.data, processor)
@@ -105,6 +107,13 @@ def check_data(config: DictConfig) -> dict:
             if label not in LABELS["emoset"]:
                 raise ValueError(f"Unknown ground truth in {split}[{index}]: {label}")
             messages = row["raw_prompt"]
+            text = "".join(
+                part["text"] for message in messages for part in message["content"] if part["type"] == "text"
+            ).strip()
+            if text != expected_prompt:
+                raise ValueError(
+                    f"{split}[{index}] uses an outdated or different prompt; regenerate the GRPO parquet files."
+                )
             images = [part for message in messages for part in message["content"] if part["type"] == "image"]
             if len(images) != 1:
                 raise ValueError(f"{split}[{index}] must contain exactly one image.")
@@ -136,7 +145,11 @@ def check_data(config: DictConfig) -> dict:
                 input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, **rope_kwargs
             )
             prompt_lengths.append(length)
-            for answer, expected in ((label, 1.0), ("unknown", 0.0)):
+            explanation = "The visible scene supports the selected emotion."
+            correct_answer = f"<draft>{explanation}</draft>\\boxed{{{label}}}"
+            wrong_label = next(candidate for candidate in LABELS["emoset"] if candidate != label)
+            wrong_answer = f"<draft>{explanation}</draft>\\boxed{{{wrong_label}}}"
+            for answer, expected in ((correct_answer, 1.0), (wrong_answer, 0.0), (label, 0.0)):
                 score = reward_fn(
                     data_source=row["data_source"], solution_str=answer, ground_truth=label, extra_info={}
                 )
