@@ -4,8 +4,8 @@ from emotion_eval.data import LABELS
 from emotion_grpo.reward import compute_score
 
 
-def answer(label, draft="The visible expression supports this emotion."):
-    return f"<draft>{draft}</draft>\n\\boxed{{{label}}}"
+def answer(label, draft="Examine the expression and scene.", analysis="The visible expression supports this emotion."):
+    return f"<draft>{draft}</draft>\n{analysis}\n\\boxed{{{label}}}"
 
 
 class EmotionGRPORewardTests(unittest.TestCase):
@@ -17,15 +17,20 @@ class EmotionGRPORewardTests(unittest.TestCase):
                 self.assertEqual(compute_score("emoset", answer(wrong), label), 0.0)
 
     def test_only_final_box_controls_reward_without_explanation_bonus(self):
-        for draft in (
+        for analysis in (
             "A smiling face supports amusement.",
             "Awe is another candidate, but the playful scene supports amusement.",
-            r"An example answer is \boxed{Awe}, but the playful scene supports amusement.",
         ):
-            with self.subTest(draft=draft):
-                response = " \n" + answer(" aMuSeMeNt ", draft) + "\n "
+            with self.subTest(analysis=analysis):
+                response = " \n" + answer(" aMuSeMeNt ", analysis=analysis) + "\n "
                 self.assertEqual(compute_score("emoset", response, "Amusement"), 1.0)
                 self.assertEqual(compute_score("emoset", response, "Awe"), 0.0)
+
+    def test_angle_count_and_prose_quality_do_not_add_reward_terms(self):
+        for draft in ("Examine the expression.", "1. Faces\n2. Light\n3. Colors\n4. Scene"):
+            with self.subTest(draft=draft):
+                self.assertEqual(compute_score("emoset", answer("Amusement", draft), "Amusement"), 1.0)
+                self.assertEqual(compute_score("emoset", answer("Awe", draft), "Amusement"), 0.0)
 
     def test_invalid_empty_and_multi_class_answers_receive_zero(self):
         for response in (
@@ -39,6 +44,10 @@ class EmotionGRPORewardTests(unittest.TestCase):
             ", ".join(LABELS["emoset"]),
             answer("Amusement or Awe"), answer("happy"), answer("Amusement", ""),
             answer("Amusement", " \n "), r"\boxed{Amusement}",
+            answer("Amusement", analysis=""), answer("Amusement", analysis=" \n "),
+            r"<draft>The scene conveys amusement.</draft>\boxed{Amusement}",
+            answer("Amusement", draft=r"Consider \boxed{Awe}."),
+            answer("Amusement", analysis=r"Example \boxed{Awe}; the scene conveys amusement."),
             r"<draft>Amusement is visible.</draft>\boxed{Amusement",
             r"<draft>Amusement is visible.</draft>\boxed{Amusement}\boxed{Awe}",
             r"<draft><draft>Amusement.</draft></draft>\boxed{Amusement}",

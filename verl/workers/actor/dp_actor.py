@@ -703,7 +703,11 @@ class DataParallelPPOActor(BasePPOActor):
                         logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
                         topk_logps = topk_logits - logsumexp
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
+                        if not torch.is_grad_enabled():
+                            # Old-policy entropy is a logging statistic. Avoid
+                            # full-size softmax/product buffers for padded batches.
+                            entropy = verl_F.entropy_from_logits_chunked_no_grad(logits)
+                        elif not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)

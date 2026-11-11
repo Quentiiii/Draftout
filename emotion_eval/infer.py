@@ -14,7 +14,7 @@ from .metrics import (
     classification_metrics, parse_angles_prediction, parse_angles_response,
     parse_draft_prediction, parse_draft_response, parse_prediction,
 )
-from .prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_ANGLES_PROMPT
+from .prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT
 from .sampling import PresencePenaltyLogitsProcessor, batch_seed, build_decoding_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -315,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     args.output_dir = args.output_dir.expanduser().resolve()
     if not args.model.is_dir():
         parser.error(f"Model directory does not exist: {args.model}")
-    template = EMOTION_ANALYSIS_ANGLES_PROMPT if args.prompt_style == "angles" else DEEPSEEK_EMOTION_PROMPT
+    template = EMOTION_ANALYSIS_DRAFT_PROMPT if args.prompt_style == "angles" else DEEPSEEK_EMOTION_PROMPT
     prompts = {
         dataset: template.format(labels=", ".join(LABELS[dataset]))
         for dataset in args.datasets

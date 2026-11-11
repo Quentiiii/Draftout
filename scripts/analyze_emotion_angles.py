@@ -25,7 +25,7 @@ if __package__ in (None, ""):
 from emotion_eval.data import LABELS, canonical_label, load_emo8, load_emotion6, load_emoset
 from emotion_eval.infer import DEFAULT_DATA, data_fingerprint
 from emotion_eval.metrics import classification_metrics, parse_angles_response, parse_draft_response
-from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_ANGLES_PROMPT
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT
 from emotion_eval.sampling import validate_decoding_config
 
 
@@ -101,7 +101,7 @@ def validate_run(root: Path, datasets: dict, style: str) -> dict:
         labels = LABELS[dataset]
         directory = root / dataset
         config = _read_json(directory / "config.json", hashes)
-        template = EMOTION_ANALYSIS_ANGLES_PROMPT if style == "angles" else DEEPSEEK_EMOTION_PROMPT
+        template = EMOTION_ANALYSIS_DRAFT_PROMPT if style == "angles" else DEEPSEEK_EMOTION_PROMPT
         expected = {
             "dataset": dataset, "split": SPLITS[dataset], "num_samples": len(samples),
             "samples_sha256": data_fingerprint(samples), "labels": list(labels),

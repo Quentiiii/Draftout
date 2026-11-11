@@ -238,6 +238,31 @@ def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
     return entropy
 
 
+@torch.no_grad()
+def entropy_from_logits_chunked_no_grad(logits: torch.Tensor, chunk_size: int = 256) -> torch.Tensor:
+    """Bound temporary memory for inference entropy without copying padded logits.
+
+    Keep the input dtype and the same entropy formula as ``entropy_from_logits``.
+    Iterate outer dimensions before slicing token rows: flattening a noncontiguous
+    response view could otherwise materialize a second full vocabulary tensor.
+    This helper is only for statistics computed without gradients.
+    """
+    if logits.ndim < 1 or chunk_size < 1:
+        raise ValueError("Expected logits with a vocabulary axis and a positive chunk_size")
+    if logits.ndim == 1:
+        return entropy_from_logits(logits)
+    if logits.shape[0] == 0:
+        return logits.new_empty(logits.shape[:-1])
+    if logits.ndim == 2:
+        return torch.cat(
+            [entropy_from_logits(logits[start : start + chunk_size])
+             for start in range(0, logits.shape[0], chunk_size)], dim=0,
+        )
+    return torch.stack(
+        [entropy_from_logits_chunked_no_grad(row, chunk_size) for row in logits.unbind(0)], dim=0,
+    )
+
+
 def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
     """Memory-efficient entropy calculation using chunked processing.
 

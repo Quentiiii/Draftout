@@ -358,6 +358,11 @@ class RayPPOTrainer:
         self.tokenizer.truncation_side = config.actor_rollout_ref.actor.get("self_distillation", {}).get("reprompt_truncation", "error")
         self.processor = processor
         self.config = config
+        self.draft_training = None
+        if config.algorithm.adv_estimator == "draft_grpo":
+            from emotion_grpo.draft_training import DraftTrainingController
+
+            self.draft_training = DraftTrainingController(config.draft_grpo)
         custom_chat_template = resolve_custom_chat_template(self.config.actor_rollout_ref.model)
         if custom_chat_template is not None:
             if self.processor is not None:
@@ -535,8 +540,12 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            # Persist enough identifiers to reconstruct each image's 2x2 draft/continuation group.
+            for key in ("image_id", "draft_id", "branch_id", "draft_token_count"):
+                if key in batch.non_tensor_batch:
+                    reward_extra_infos_to_dump[key] = batch.non_tensor_batch[key].tolist()
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
@@ -1528,6 +1537,10 @@ class RayPPOTrainer:
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
+        # DataProto.pop does not copy meta_info unless explicitly requested.
+        if "draft_rollout" in batch.meta_info:
+            gen_batch.meta_info["draft_rollout"] = batch.meta_info["draft_rollout"]
+
         return gen_batch
 
     def _validate(self, merged: bool = False):
@@ -1948,6 +1961,10 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        if getattr(self, "draft_training", None) is not None:
+            # Save statistics before publishing the checkpoint as resumable.
+            self.draft_training.save(local_global_step_folder, self.global_steps)
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1999,6 +2016,9 @@ class RayPPOTrainer:
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
+
+        if getattr(self, "draft_training", None) is not None:
+            self.draft_training.load(global_step_folder, self.global_steps)
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -2312,6 +2332,11 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        if self.draft_training is not None:
+            self.draft_training.begin_session(self.global_steps)
+            print(f"Draft GRPO: ordinary GRPO for steps {self.global_steps + 1}–"
+                  f"{self.global_steps + self.draft_training.warmup_steps}; draft rollout afterwards.")
+
         current_epoch = self.global_steps // len(self.train_dataloader)
 
         # perform validation before training
@@ -2364,6 +2389,9 @@ class RayPPOTrainer:
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
+
+                if self.draft_training is not None:
+                    self.draft_training.prepare_batch(batch, self.global_steps)
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -2575,7 +2603,10 @@ class RayPPOTrainer:
                         if skip_advantage_for_vopd and "self_distillation_mask" in batch.batch.keys():
                             skip_advantage_for_vopd = bool(torch.all(batch.batch["self_distillation_mask"] > 0.5).item())
 
-                        if not skip_advantage_for_vopd:
+                        if self.draft_training is not None:
+                            batch, draft_metrics = self.draft_training.compute_advantage(batch, self.global_steps)
+                            metrics.update(draft_metrics)
+                        elif not skip_advantage_for_vopd:
                             # compute advantages, executed on the driver process
                             norm_adv_by_std_in_grpo = self.config.algorithm.get(
                                 "norm_adv_by_std_in_grpo", True

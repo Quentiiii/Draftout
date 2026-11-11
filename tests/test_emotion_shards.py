@@ -7,7 +7,7 @@ from unittest.mock import patch
 from emotion_eval.data import LABELS, Sample
 from emotion_eval.infer import argument_parser, data_fingerprint, prepare_run
 from emotion_eval.metrics import parse_angles_response, parse_draft_response
-from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_ANGLES_PROMPT
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT
 from scripts import aggregate_emotion_shards as merger
 
 
@@ -74,7 +74,7 @@ class AggregateShardTests(unittest.TestCase):
         """Produce actual version-4 configs with valid and missing-analysis outputs."""
         for dataset, samples in self.datasets.items():
             labels = LABELS[dataset]
-            prompt = EMOTION_ANALYSIS_ANGLES_PROMPT.format(labels=", ".join(labels))
+            prompt = EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(labels))
             for index in range(2):
                 arguments = [
                     "--output-dir", str(self.root / f"shard_{index}"),
@@ -203,7 +203,7 @@ class AggregateShardTests(unittest.TestCase):
             self.assertEqual(config["format_version"], 4)
             self.assertEqual(config["prompt_style"], "angles")
             self.assertEqual(config["response_format"], "angles_then_analysis_then_boxed_label")
-            self.assertEqual(config["prompt"], EMOTION_ANALYSIS_ANGLES_PROMPT.format(
+            self.assertEqual(config["prompt"], EMOTION_ANALYSIS_DRAFT_PROMPT.format(
                 labels=", ".join(LABELS[dataset]),
             ))
             self.assertTrue(config["do_sample"])

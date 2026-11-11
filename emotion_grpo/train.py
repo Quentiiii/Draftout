@@ -3,11 +3,97 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 from pathlib import Path
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+
+
+def prompt_contract(config: DictConfig | None = None) -> dict:
+    """Bind resumable checkpoints to the current prompt and reward semantics."""
+    from emotion_grpo.prepare_data import PROMPT
+
+    contract = {
+        "schema_version": 1,
+        "prompt": PROMPT,
+        "prompt_sha256": hashlib.sha256(PROMPT.encode("utf-8")).hexdigest(),
+        "reward": "strict_angles_correct_label_0_or_1_v1",
+    }
+    if config is not None and config.get("algorithm", {}).get("adv_estimator") == "draft_grpo":
+        draft = config.draft_grpo
+        contract.update({
+            "schema_version": 2,
+            "method": "draft_grpo_v1",
+            "reward": "single_boxed_correct_label_0_or_1_v1",
+            "warmup": {
+                "steps_per_launch": draft.warmup_steps,
+                "adv_estimator": "grpo",
+                "reward": "strict_angles_correct_label_0_or_1_v1",
+            },
+            "draft_grpo": {key: draft[key] for key in (
+                "num_drafts", "num_continuations_per_draft", "ema_beta", "shrink_min", "eps",
+            )},
+        })
+    return contract
+
+
+def check_checkpoint_prompt(config: DictConfig) -> dict:
+    """Reject old/unknown-prompt checkpoints before creating any GPU workers."""
+    expected = prompt_contract(config)
+    directory = Path(config.trainer.default_local_dir).expanduser().resolve()
+    mode = config.trainer.resume_mode
+    has_checkpoints = any(directory.glob("global_step_*"))
+    if mode == "disable" and has_checkpoints:
+        raise FileExistsError(
+            f"Checkpoints already exist in {directory}; set trainer.resume_mode=auto to resume "
+            "or choose a new trainer.experiment_name."
+        )
+    sources = [(directory, mode == "auto" and has_checkpoints)]
+    if mode == "resume_path":
+        value = config.trainer.get("resume_from_path")
+        if not isinstance(value, str) or not value:
+            raise ValueError("trainer.resume_from_path must identify a checkpoint step directory.")
+        checkpoint = Path(value).expanduser().resolve()
+        if not checkpoint.is_dir() or not checkpoint.name.startswith("global_step_"):
+            raise ValueError(f"Expected an existing global_step_* checkpoint directory: {checkpoint}")
+        sources.append((checkpoint.parent, True))
+    for source, required in sources:
+        path = source / "prompt_contract.json"
+        if not path.is_file():
+            if required:
+                raise ValueError(
+                    f"Cannot resume checkpoints without an angles prompt contract: {source}. "
+                    "Use a new trainer.experiment_name to train with the current prompt."
+                )
+            continue
+        if json.loads(path.read_text(encoding="utf-8")) != expected:
+            raise ValueError(
+                f"Checkpoint prompt/reward contract does not match the current angles recipe: {path}. "
+                "Use a new trainer.experiment_name."
+            )
+    if expected["schema_version"] == 2:
+        checkpoint = None
+        if mode == "resume_path":
+            checkpoint = Path(config.trainer.resume_from_path).expanduser().resolve()
+        elif mode == "auto" and has_checkpoints:
+            tracker = directory / "latest_checkpointed_iteration.txt"
+            if not tracker.is_file():
+                raise ValueError(f"Draft checkpoints exist without a latest checkpoint tracker: {directory}")
+            try:
+                step = int(tracker.read_text(encoding="utf-8").strip())
+            except ValueError as error:
+                raise ValueError(f"Invalid latest checkpoint tracker: {tracker}") from error
+            if step < 0:
+                raise ValueError(f"Invalid latest checkpoint step: {step}")
+            checkpoint = directory / f"global_step_{step}"
+        if checkpoint is not None:
+            state_path = checkpoint / "draft_advantage_state.json"
+            if not checkpoint.is_dir() or not state_path.is_file():
+                raise ValueError(f"Cannot resume draft GRPO without EMA state: {state_path}")
+    return expected
 
 
 def check_config(config: DictConfig) -> None:
@@ -17,8 +103,35 @@ def check_config(config: DictConfig) -> None:
 
     actor = config.actor_rollout_ref.actor
     rollout = config.actor_rollout_ref.rollout
-    if config.algorithm.adv_estimator != "grpo" or actor.policy_loss.loss_mode != "vanilla":
-        raise ValueError("This entry point requires GRPO advantages and vanilla clipped policy loss.")
+    estimator = config.algorithm.adv_estimator
+    if estimator not in ("grpo", "draft_grpo") or actor.policy_loss.loss_mode != "vanilla":
+        raise ValueError("This entry point requires GRPO/draft GRPO advantages and vanilla clipped policy loss.")
+    if estimator == "draft_grpo":
+        draft = config.get("draft_grpo")
+        if draft is None:
+            raise ValueError("Draft GRPO requires the draft_grpo configuration.")
+        for key in ("num_drafts", "num_continuations_per_draft"):
+            if draft.get(key) != 2:
+                raise ValueError(f"Draft GRPO requires {key}=2.")
+        if rollout.n != 4:
+            raise ValueError("Draft GRPO requires rollout.n=4 for its 2 x 2 leaves.")
+        if draft.get("warmup_steps") != 10:
+            raise ValueError("Draft GRPO requires warmup_steps=10 on every launch, including resume.")
+        for key in ("ema_beta", "shrink_min", "eps"):
+            value = draft.get(key)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"Draft GRPO requires a finite {key}.")
+        if not 0 <= draft.ema_beta < 1 or not 0 <= draft.shrink_min <= 1 or draft.eps <= 0:
+            raise ValueError("Draft GRPO requires ema_beta in [0,1), shrink_min in [0,1], and eps > 0.")
+        if config.algorithm.norm_adv_by_std_in_grpo:
+            raise ValueError("Draft GRPO forbids GRPO advantage normalization and whitening.")
+        expected_manager = "emotion_grpo.draft_rollout.DraftAgentLoopManager"
+        if rollout.agent.get("agent_loop_manager_class") != expected_manager:
+            raise ValueError(f"Draft GRPO requires rollout.agent.agent_loop_manager_class={expected_manager}.")
+        if rollout.name != "vllm" or rollout.mode != "async":
+            raise ValueError("Draft GRPO uses the existing async vLLM rollout path.")
+        if config.custom_reward_function.name != "compute_draft_score":
+            raise ValueError("Draft GRPO requires custom_reward_function.name=compute_draft_score.")
     if rollout.n < 2 or not rollout.do_sample or rollout.temperature <= 0:
         raise ValueError("GRPO requires at least two sampled answers per image and temperature > 0.")
     if need_reference_policy(config) or need_critic(config) or config.reward_model.enable:
@@ -67,7 +180,7 @@ def check_config(config: DictConfig) -> None:
 def check_data(config: DictConfig) -> dict:
     """Exercise real parquet loading, image processing, templates and rewards."""
     from emotion_eval.data import LABELS
-    from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT
+    from emotion_eval.prompts import EMOTION_ANALYSIS_DRAFT_PROMPT
     from verl.trainer.ppo.reward import get_custom_reward_fn
     from verl.utils import hf_processor, hf_tokenizer
     from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -86,8 +199,11 @@ def check_data(config: DictConfig) -> dict:
     if reward_fn is None:
         raise ValueError("A correctness reward function must be configured.")
 
-    result = {"model": str(model_path), "splits": {}}
-    expected_prompt = DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(LABELS["emoset"]))
+    draft_method = config.algorithm.adv_estimator == "draft_grpo"
+    result = {"model": str(model_path), "prompt_style": "angles", "splits": {}}
+    if draft_method:
+        result["method"] = "draft_grpo_v1"
+    expected_prompt = EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(LABELS["emoset"]))
     split_ids = {}
     for split, paths in (("train", config.data.train_files), ("val", config.data.val_files)):
         dataset = RLHFDataset(paths, tokenizer, config.data, processor)
@@ -145,14 +261,35 @@ def check_data(config: DictConfig) -> dict:
                 input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, **rope_kwargs
             )
             prompt_lengths.append(length)
-            explanation = "The visible scene supports the selected emotion."
-            correct_answer = f"<draft>{explanation}</draft>\\boxed{{{label}}}"
+            plan = "Examine the facial expression and the surrounding scene."
+            analysis = "The visible scene supports the selected emotion."
+            correct_answer = f"<draft>{plan}</draft>\n{analysis}\n\\boxed{{{label}}}"
             wrong_label = next(candidate for candidate in LABELS["emoset"] if candidate != label)
-            wrong_answer = f"<draft>{explanation}</draft>\\boxed{{{wrong_label}}}"
-            for answer, expected in ((correct_answer, 1.0), (wrong_answer, 0.0), (label, 0.0)):
+            wrong_answer = f"<draft>{plan}</draft>\n{analysis}\n\\boxed{{{wrong_label}}}"
+            old_draft_answer = f"<draft>{analysis}</draft>\\boxed{{{label}}}"
+            reward_cases = [
+                (correct_answer, 1.0, {}), (wrong_answer, 0.0, {}),
+                (old_draft_answer, 1.0 if draft_method else 0.0, {}), (label, 0.0, {}),
+            ]
+            if draft_method:
+                reward_cases.extend([
+                    (f"\\boxed{{{label}}}", 1.0, {}),
+                    (correct_answer + f"\\boxed{{{label}}}", 0.0, {}),
+                    (correct_answer, 1.0, {"draft_grpo_warmup": True}),
+                    (wrong_answer, 0.0, {"draft_grpo_warmup": True}),
+                    (old_draft_answer, 0.0, {"draft_grpo_warmup": True}),
+                    (f"\\boxed{{{label}}}", 0.0, {"draft_grpo_warmup": True}),
+                ])
+            for answer, expected, reward_context in reward_cases:
                 score = reward_fn(
-                    data_source=row["data_source"], solution_str=answer, ground_truth=label, extra_info={}
+                    data_source=row["data_source"], solution_str=answer, ground_truth=label,
+                    extra_info=reward_context,
                 )
+                if draft_method:
+                    if not isinstance(score, dict) or not {"score", "task_reward", "format_valid"} <= score.keys():
+                        raise ValueError("Draft correctness reward must report score, task_reward, and format_valid.")
+                    if any(score[key] not in (0.0, 1.0) for key in ("score", "task_reward", "format_valid")):
+                        raise ValueError("Draft correctness and format diagnostics must be binary.")
                 if isinstance(score, dict):
                     score = score["score"]
                 if score != expected:
@@ -173,6 +310,7 @@ def main(config: DictConfig) -> None:
     import torch
 
     check_config(config)
+    contract = check_checkpoint_prompt(config)
     if not config.dry_run:
         expected = config.trainer.n_gpus_per_node
         if not torch.cuda.is_available() or torch.cuda.device_count() < expected:
@@ -185,13 +323,12 @@ def main(config: DictConfig) -> None:
     if config.dry_run:
         print("CPU preflight passed. Model weights, GPU rollout and distributed training were not exercised.")
         return
-    checkpoint_dir = Path(config.trainer.default_local_dir)
-    if config.trainer.resume_mode == "disable" and any(checkpoint_dir.glob("global_step_*")):
-        raise FileExistsError(
-            f"Checkpoints already exist in {checkpoint_dir}; set trainer.resume_mode=auto to resume "
-            "or choose a new trainer.experiment_name."
-        )
+    checkpoint_dir = Path(config.trainer.default_local_dir).expanduser().resolve()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    contract_path = checkpoint_dir / "prompt_contract.json"
+    temporary = contract_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(contract_path)
     OmegaConf.save(config, checkpoint_dir / "resolved_config.yaml", resolve=True)
     from verl.trainer.main_ppo import run_ppo
 

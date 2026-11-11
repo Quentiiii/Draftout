@@ -19,7 +19,7 @@ from emotion_eval.metrics import (
     classification_metrics, parse_angles_prediction, parse_angles_response,
     parse_draft_prediction, parse_draft_response,
 )
-from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_ANGLES_PROMPT
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT
 from emotion_eval.sampling import SAMPLING_KEYS, validate_decoding_config
 
 
@@ -109,7 +109,7 @@ def aggregate(input_dir: Path, data_root: Path = DEFAULT_DATA, num_shards: int =
             else:
                 raise ValueError(f"Unsupported format version in {config_path}: {version}")
             angles = version == 4
-            template = EMOTION_ANALYSIS_ANGLES_PROMPT if angles else DEEPSEEK_EMOTION_PROMPT
+            template = EMOTION_ANALYSIS_DRAFT_PROMPT if angles else DEEPSEEK_EMOTION_PROMPT
             if not angles and config.get("prompt_style", "draft") != "draft":
                 raise ValueError(f"Invalid legacy prompt style configuration in {config_path}")
             expected_fields = {

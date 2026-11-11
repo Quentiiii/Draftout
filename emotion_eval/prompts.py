@@ -18,12 +18,11 @@ DEEPSEEK_EMOTION_PROMPT = (
     "\\boxed{{LABEL}}"
 )
 
-# Plan 1–3 analysis angles in <draft>, then analyze outside the draft.
-EMOTION_ANALYSIS_ANGLES_PROMPT = (
+EMOTION_ANALYSIS_DRAFT_PROMPT = (
     "What is the primary emotion conveyed by the image?\n"
     "Choose exactly one label from: {labels}.\n"
-    "First, outline 1–3 analysis angles for this image in <draft>...</draft>, "
-    "briefly specifying what to examine. Then analyze the visible evidence "
-    "from these angles to infer the emotion. Finally, output the chosen label "
-    "in \\boxed{{}}."
+    "First, List 1-3 emotion-relevant analysis angles for this image in <draft>...</draft>, without analysis. " 
+    "Then jointly analyze the visible evidence from these angles in one concise paragraph to infer the emotion. "
+    "Finally, output the chosen label in \\boxed{{}}."
 )
+

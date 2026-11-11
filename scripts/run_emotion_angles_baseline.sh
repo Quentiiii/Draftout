@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Qwen3.5-4B: draft angles, evidence analysis, then a boxed emotion label.
+# Qwen3.5-2B/4B: draft angles, evidence analysis, then a boxed emotion label.
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${PYTHON_BIN:-/data/xiyan.zhao/anaconda3/envs/vision-opd/bin/python}"
-model_dir="${MODEL_DIR:-/data/xiyan.zhao/work/model/Qwen3.5-4B}"
-result_dir="${OUTPUT_DIR:-$project_dir/outputs/qwen35_4b_emotion_angles_sampled_seed42}"
+model_size="${MODEL_SIZE:-4B}"
+case "$model_size" in
+  2B|4B) ;;
+  *) echo "MODEL_SIZE must be 2B or 4B" >&2; exit 2 ;;
+esac
+model_dir="${MODEL_DIR:-/data/xiyan.zhao/work/model/Qwen3.5-$model_size}"
+result_dir="${OUTPUT_DIR:-$project_dir/outputs/qwen35_${model_size,,}_emotion_angles_sampled_seed42}"
+baseline_dir="${BASELINE_DIR:-$project_dir/outputs/qwen35_${model_size,,}_emotion_draft_sampled_seed42}"
 batch_size="${BATCH_SIZE:-32}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 IFS=',' read -r -a gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
@@ -13,17 +19,20 @@ num_shards="${#gpu_ids[@]}"
 export LD_LIBRARY_PATH="/data/xiyan.zhao/anaconda3/envs/vision-opd/lib:${LD_LIBRARY_PATH:-}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 cd "$project_dir"
 mkdir -p "$result_dir/logs"
 
 record_state() {
-  "$python_bin" - "$result_dir" "$model_dir" "$1" "$CUDA_VISIBLE_DEVICES" "$batch_size" "$num_shards" <<'PY'
+  "$python_bin" - "$result_dir" "$model_dir" "$1" "$CUDA_VISIBLE_DEVICES" "$batch_size" "$num_shards" "$model_size" "$baseline_dir" <<'PY'
 import json
+import os
+import shlex
 import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
-root, model, state, devices, batch, shards = sys.argv[1:]
+root, model, state, devices, batch, shards, model_size, baseline = sys.argv[1:]
 root = Path(root)
 path = root / 'run_metadata.json'
 data = json.loads(path.read_text()) if path.exists() else {}
@@ -37,8 +46,20 @@ data.update(model=model, status=state, updated_at=now, cuda_visible_devices=devi
             presence_penalty=1.5, repetition_penalty=1.0, seed=42,
             seed_policy='sha256_batch_sample_ids_v1', presence_penalty_scope='generated_tokens_only',
             expected_samples={'emoset': 17716, 'emotion6': 1980, 'emo8': 8930},
-            reproduce='bash scripts/run_emotion_angles_baseline.sh')
+            baseline_directory=baseline, model_size=model_size,
+            pytorch_alloc_conf=os.environ.get('PYTORCH_ALLOC_CONF'),
+            reproduce=shlex.join(['env', f'CUDA_VISIBLE_DEVICES={devices}', f'MODEL_SIZE={model_size}',
+                                 f'MODEL_DIR={model}', f'OUTPUT_DIR={root}', f'BASELINE_DIR={baseline}',
+                                 f'BATCH_SIZE={batch}', 'bash', 'scripts/run_emotion_angles_baseline.sh']))
+if state == 'running':
+    data.update(analysis_status='waiting_for_inference')
+    data.pop('analysis_error', None)
+elif state == 'validating':
+    data.update(analysis_status='running')
+elif state == 'validation_failed':
+    data.update(analysis_status='failed')
 if state == 'complete':
+    data.update(analysis_status='complete', analysis_finished_at=now)
     summary = json.loads((root / 'summary.json').read_text())
     data.update(finished_at=now, total_evaluated=sum(m['num_samples'] for m in summary.values()),
                 metrics={ds: {key:m[key] for key in ('num_samples','num_correct','num_invalid','accuracy','macro_f1')}
@@ -87,7 +108,7 @@ if (( num_shards > 1 )); then
   fi
 fi
 record_state validating
-if ! "$python_bin" scripts/analyze_emotion_angles.py --input-dir "$result_dir"; then
+if ! "$python_bin" scripts/analyze_emotion_angles.py --input-dir "$result_dir" --baseline-dir "$baseline_dir"; then
   record_state validation_failed
   exit 1
 fi

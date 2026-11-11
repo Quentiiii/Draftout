@@ -4,7 +4,7 @@ defaults:
 
 # Paths are absolute so Ray workers use the same local files.
 project_root: /data/xiyan.zhao/work/Draftout
-data_dir: ${project_root}/outputs/emoset_grpo/data
+data_dir: ${project_root}/outputs/emoset_grpo/data_angles_concise_20261110
 dry_run: false
 
 data:
@@ -13,8 +13,8 @@ data:
   val_files: ["${data_dir}/val.parquet"]
   train_batch_size: 8
   max_prompt_length: 1024
-  # Shared <draft> explanation followed by the boxed emotion label.
-  max_response_length: 512
+  # Draft outline, separate evidence analysis, then the boxed emotion label.
+  max_response_length: 1024
   image_patch_size: 16
   # Do not silently remove any of the selected 2,000 examples.
   filter_overlong_prompts: false
@@ -37,7 +37,7 @@ actor_rollout_ref:
   actor:
     strategy: fsdp2
     ppo_mini_batch_size: 8
-    ppo_micro_batch_size_per_gpu: 16
+    ppo_micro_batch_size_per_gpu: 2
     ppo_epochs: 1
     use_dynamic_bsz: false
     ulysses_sequence_parallel_size: 1
@@ -83,10 +83,10 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.5
     enforce_eager: true
     enable_prefix_caching: false
-    max_model_len: 1536
+    max_model_len: 2048
     max_num_batched_tokens: 4096
     max_num_seqs: 32
-    log_prob_micro_batch_size_per_gpu: 16
+    log_prob_micro_batch_size_per_gpu: 2
     log_prob_use_dynamic_bsz: false
     calculate_log_probs: false
     engine_kwargs:
@@ -130,18 +130,18 @@ custom_reward_function:
 
 trainer:
   project_name: Draftout
-  experiment_name: emoset_grpo_2k
+  experiment_name: emoset_grpo_2b_angles_concise_2k_20261110
   logger: [console]
   nnodes: 1
   n_gpus_per_node: 2
   use_legacy_worker_impl: enable
-  # Total includes completed epochs: step 250 -> 2500 with the default batch.
+  # Current concise draft run: 250 steps/epoch at the default effective batch.
   total_epochs: 10
   val_before_train: true
   test_freq: 25
   save_freq: 25
   max_actor_ckpt_to_keep: 2
-  # Restore model, optimizer, scheduler, RNG and dataloader from the latest step.
+  # Resume only checkpoints carrying the same prompt/reward contract.
   resume_mode: auto
   default_local_dir: ${project_root}/outputs/emoset_grpo/checkpoints/${trainer.experiment_name}
   validation_data_dir: ${trainer.default_local_dir}/validation

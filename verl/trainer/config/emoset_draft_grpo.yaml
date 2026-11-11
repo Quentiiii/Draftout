@@ -1,0 +1,30 @@
+defaults:
+  - emoset_grpo
+  - _self_
+
+# Same model, data, optimizer, PPO loss aggregation and KL settings as GRPO.
+algorithm:
+  adv_estimator: draft_grpo
+  norm_adv_by_std_in_grpo: false
+
+draft_grpo:
+  num_drafts: 2
+  num_continuations_per_draft: 2
+  ema_beta: 0.9
+  shrink_min: 0.1
+  eps: 1.0e-6
+  # Count updates since this process loaded its checkpoint, including on resume.
+  warmup_steps: 10
+
+actor_rollout_ref:
+  rollout:
+    agent:
+      agent_loop_manager_class: emotion_grpo.draft_rollout.DraftAgentLoopManager
+
+custom_reward_function:
+  name: compute_draft_score
+
+trainer:
+  experiment_name: emoset_draft_grpo_2b_2k
+  # Keep leaf IDs/prefix boundaries inspectable with the existing JSONL logger.
+  rollout_data_dir: ${trainer.default_local_dir}/rollout

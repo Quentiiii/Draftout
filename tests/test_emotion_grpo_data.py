@@ -5,10 +5,12 @@ from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
-from emotion_eval.deepseek import PROMPT as DEEPSEEK_PROMPT
-from emotion_eval.prompts import EMOTION_PROMPT
+from omegaconf import OmegaConf
+
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT
 from emotion_grpo.prepare_data import (
     ARTIFACT_NAMES,
+    DEFAULT_OUTPUT_DIR,
     EMOSET_LABELS,
     PROMPT,
     SplitEntry,
@@ -19,6 +21,7 @@ from emotion_grpo.prepare_data import (
     select_entries,
     sha256_file,
 )
+from emotion_grpo.train import check_checkpoint_prompt, prompt_contract
 
 
 class GrpoDataTests(unittest.TestCase):
@@ -71,7 +74,8 @@ class GrpoDataTests(unittest.TestCase):
             check_disjoint({"train": train, "val": read_split(self.root, "val"), "test": [train[-1]]})
 
     def test_schema_and_prompt_do_not_leak_per_example_information(self):
-        self.assertEqual(PROMPT, "<image>\n" + DEEPSEEK_PROMPT)
+        self.assertEqual(PROMPT, "<image>\n" + EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(EMOSET_LABELS)))
+        self.assertEqual(DEFAULT_OUTPUT_DIR.name, "data_angles_concise_20261110")
         self.write_split("train")
         selected = select_entries(read_split(self.root, "train"), 8, 42)
         rows, manifest = make_rows(self.root, "train", selected)
@@ -133,7 +137,7 @@ class GrpoDataTests(unittest.TestCase):
         for split in ("train", "val", "test"):
             self.write_split(split)
         config = {"dataset_root": self.root, "output_dir": self.output, "train_size": 8, "val_size": 8}
-        old_prompt = "<image>\n" + EMOTION_PROMPT.format(labels=", ".join(EMOSET_LABELS))
+        old_prompt = "<image>\n" + DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(EMOSET_LABELS))
         with patch("emotion_grpo.prepare_data.PROMPT", old_prompt):
             previous = prepare_dataset(**config)
         hashes = {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES}
@@ -142,7 +146,7 @@ class GrpoDataTests(unittest.TestCase):
         self.assertEqual(hashes, {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES})
 
         current = prepare_dataset(**config, overwrite=True)
-        self.assertEqual(current["prompt"], "<image>\n" + DEEPSEEK_PROMPT)
+        self.assertEqual(current["prompt"], PROMPT)
         self.assertNotEqual(previous["prompt_sha256"], current["prompt_sha256"])
         for split in ("train", "val"):
             self.assertEqual(hashes[f"{split}_manifest.jsonl"], sha256_file(self.output / f"{split}_manifest.jsonl"))
@@ -158,6 +162,57 @@ class GrpoDataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identical image contents"):
             prepare_dataset(self.root, self.output, train_size=8, val_size=8)
         self.assertFalse(self.output.exists())
+
+
+class GrpoPromptResumeTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.directory = self.root / "new_angles_experiment"
+        self.config = OmegaConf.create({"trainer": {
+            "default_local_dir": str(self.directory), "resume_mode": "auto", "resume_from_path": None,
+        }})
+
+    def test_fresh_check_creates_no_training_state(self):
+        self.assertEqual(check_checkpoint_prompt(self.config), prompt_contract())
+        self.assertFalse(self.directory.exists())
+
+    def test_auto_resume_rejects_missing_old_or_different_prompt_contract(self):
+        (self.directory / "global_step_25").mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, "without an angles prompt contract"):
+            check_checkpoint_prompt(self.config)
+        path = self.directory / "prompt_contract.json"
+        old = {**prompt_contract(), "prompt": DEEPSEEK_EMOTION_PROMPT}
+        path.write_text(json.dumps(old))
+        before = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            check_checkpoint_prompt(self.config)
+        self.assertEqual(path.read_bytes(), before)
+        path.write_text(json.dumps(prompt_contract()))
+        self.assertEqual(check_checkpoint_prompt(self.config), prompt_contract())
+
+    def test_resume_from_path_validates_source_experiment(self):
+        source = self.root / "old_experiment"
+        step = source / "global_step_25"
+        step.mkdir(parents=True)
+        self.config.trainer.resume_mode = "resume_path"
+        self.config.trainer.resume_from_path = str(step)
+        with self.assertRaisesRegex(ValueError, "without an angles prompt contract"):
+            check_checkpoint_prompt(self.config)
+        path = source / "prompt_contract.json"
+        path.write_text(json.dumps({**prompt_contract(), "reward": "old_draft_reward"}))
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            check_checkpoint_prompt(self.config)
+        path.write_text(json.dumps(prompt_contract()))
+        self.assertEqual(check_checkpoint_prompt(self.config), prompt_contract())
+        self.assertFalse(self.directory.exists())
+
+    def test_disabled_resume_still_refuses_existing_checkpoints(self):
+        (self.directory / "global_step_25").mkdir(parents=True)
+        self.config.trainer.resume_mode = "disable"
+        with self.assertRaises(FileExistsError):
+            check_checkpoint_prompt(self.config)
 
 
 if __name__ == "__main__":

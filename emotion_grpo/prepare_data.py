@@ -14,12 +14,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from emotion_eval.data import IMAGE_SUFFIXES, LABELS, canonical_label
-from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT
+from emotion_eval.prompts import EMOTION_ANALYSIS_DRAFT_PROMPT
 
 EMOSET_LABELS = LABELS["emoset"]
-PROMPT = "<image>\n" + DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(EMOSET_LABELS))
+PROMPT = "<image>\n" + EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(EMOSET_LABELS))
 DEFAULT_DATASET_ROOT = Path("/data/xiyan.zhao/work/dataset/EMOSET")
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "emoset_grpo" / "data"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "emoset_grpo" / "data_angles_concise_20261110"
 ARTIFACT_NAMES = (
     "train.parquet", "val.parquet", "train_manifest.jsonl", "val_manifest.jsonl", "metadata.json",
 )

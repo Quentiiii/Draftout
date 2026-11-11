@@ -23,7 +23,7 @@ sys.path.insert(0, str(PROJECT))
 
 from emotion_eval.data import LABELS, canonical_label, load_emoset
 from emotion_eval.infer import QwenPredictor, data_fingerprint, write_json
-from emotion_eval.prompts import EMOTION_ANALYSIS_ANGLES_PROMPT
+from emotion_eval.prompts import EMOTION_ANALYSIS_DRAFT_PROMPT
 from emotion_eval.sampling import build_decoding_config
 
 
@@ -53,7 +53,7 @@ def main():
         if args.samples_per_class > len(candidates):
             parser.error(f"Not enough test samples for {label}")
         samples.extend(rng.sample(candidates, args.samples_per_class))
-    prompt = EMOTION_ANALYSIS_ANGLES_PROMPT.format(labels=", ".join(labels))
+    prompt = EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(labels))
     inference = argparse.Namespace(
         model=args.model, device=args.device, dtype="bfloat16", batch_size=1,
         max_new_tokens=args.max_new_tokens, min_pixels=65536, max_pixels=1048576,
@@ -62,7 +62,7 @@ def main():
     )
     config = {
         "model":str(args.model), "dataset":"emoset", "split":"official_test",
-        "prompt_name":"EMOTION_ANALYSIS_ANGLES_PROMPT", "prompt":prompt,
+        "prompt_name":"EMOTION_ANALYSIS_DRAFT_PROMPT", "prompt":prompt,
         "selection":"Sort official test IDs within each class, then random.Random(seed).sample per class, before inference.",
         "selection_seed":args.seed, "samples_per_class":args.samples_per_class,
         "num_samples":len(samples), "samples_sha256":data_fingerprint(samples),

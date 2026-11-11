@@ -11,7 +11,7 @@ from unittest.mock import patch
 from emotion_eval.data import LABELS, Sample
 from emotion_eval.infer import argument_parser, main
 from emotion_eval.metrics import parse_angles_prediction, parse_angles_response
-from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_ANGLES_PROMPT
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT
 
 
 def angles_answer(label="Awe", draft="Consider the scene's scale and lighting.",
@@ -97,7 +97,7 @@ class AnglesInferenceTests(unittest.TestCase):
         draft = "Consider the scene's scale and lighting."
         analysis = "Fear is less apt than awe because of the mountain's immense scale."
         response = angles_answer("Awe", draft, analysis)
-        expected_prompt = EMOTION_ANALYSIS_ANGLES_PROMPT.format(labels=", ".join(LABELS["emoset"]))
+        expected_prompt = EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(LABELS["emoset"]))
         with patch("emotion_eval.infer.load_emoset", return_value=self.samples), \
                 patch("emotion_eval.infer.QwenPredictor") as predictor:
             predictor.return_value.predict.return_value = [response]
