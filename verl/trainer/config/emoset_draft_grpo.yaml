@@ -13,8 +13,9 @@ draft_grpo:
   ema_beta: 0.9
   shrink_min: 0.1
   eps: 1.0e-6
-  # Count updates since this process loaded its checkpoint, including on resume.
-  warmup_steps: 10
+  # Warm up fresh runs; resumed checkpoints continue directly with Draft updates.
+  warmup_steps: 20
+  warmup_on_resume: false
 
 actor_rollout_ref:
   rollout:
@@ -25,6 +26,6 @@ custom_reward_function:
   name: compute_draft_score
 
 trainer:
-  experiment_name: emoset_draft_grpo_2b_2k
+  experiment_name: emoset_draft_grpo_2b_2k_warmup20_fallback
   # Keep leaf IDs/prefix boundaries inspectable with the existing JSONL logger.
   rollout_data_dir: ${trainer.default_local_dir}/rollout

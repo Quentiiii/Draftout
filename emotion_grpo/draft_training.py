@@ -1,4 +1,4 @@
-"""Small driver-side lifecycle for draft advantages and per-launch GRPO warmup."""
+"""Driver-side draft advantages with fresh-start GRPO warmup and optional rewarmup."""
 
 from __future__ import annotations
 
@@ -15,14 +15,17 @@ class DraftTrainingController:
     state_filename = "draft_advantage_state.json"
 
     def __init__(self, config):
-        self.warmup_steps = int(config.get("warmup_steps", 10))
-        if self.warmup_steps != 10:
-            raise ValueError("This recipe requires 10 ordinary GRPO updates on every launch.")
+        self.warmup_steps = int(config.get("warmup_steps", 20))
+        if self.warmup_steps != 20:
+            raise ValueError("This recipe requires 20 ordinary GRPO updates when warmup is enabled.")
+        self.warmup_on_resume = config.get("warmup_on_resume", False)
+        if not isinstance(self.warmup_on_resume, bool):
+            raise ValueError("warmup_on_resume must be a bool")
         self.estimator = DraftAdvantageEstimator(config)
         self.session_start_step = None
 
     def begin_session(self, completed_global_step: int) -> None:
-        # This counter is intentionally reset after *every* checkpoint load.
+        # Track this launch separately; checkpoint EMA state remains untouched.
         self.session_start_step = int(completed_global_step)
 
     def is_warmup(self, global_step: int) -> bool:
@@ -31,6 +34,8 @@ class DraftTrainingController:
         session_step = int(global_step) - self.session_start_step
         if session_step <= 0:
             raise ValueError("Training global_step must follow the resumed checkpoint step")
+        if self.session_start_step > 0 and not self.warmup_on_resume:
+            return False
         return session_step <= self.warmup_steps
 
     def prepare_batch(self, batch, global_step: int) -> None:
@@ -75,6 +80,7 @@ class DraftTrainingController:
             "version": 1,
             "global_step": int(global_step),
             "warmup_steps_per_launch": self.warmup_steps,
+            "warmup_on_resume": self.warmup_on_resume,
             "estimator": self.estimator.state_dict(),
         }
         temporary = path.with_suffix(".json.tmp")
@@ -89,4 +95,6 @@ class DraftTrainingController:
         if (payload.get("version") != 1 or payload.get("global_step") != int(global_step)
                 or payload.get("warmup_steps_per_launch") != self.warmup_steps):
             raise ValueError(f"Draft EMA checkpoint metadata mismatch: {path}")
+        # warmup_on_resume is a launch policy, not an EMA compatibility field.
+        # Older checkpoints omit it; current configuration governs either case.
         self.estimator.load_state_dict(payload["estimator"])

@@ -48,6 +48,19 @@ def idle_gpus(snapshot):
             and gpu["used_mib"] <= 1024 and gpu["utilization"] <= 5]
 
 
+def select_gpus(snapshot, requested_gpus=None):
+    """Require every explicitly requested physical GPU; never substitute others."""
+    available = idle_gpus(snapshot)
+    if requested_gpus is None:
+        return available[:2] if len(available) >= 2 else []
+    if len(requested_gpus) != 2 or len(set(requested_gpus)) != 2:
+        raise ValueError("Request exactly two distinct GPU indices.")
+    by_index = {gpu["index"]: gpu for gpu in available}
+    if not all(index in by_index for index in requested_gpus):
+        return []
+    return [by_index[index] for index in requested_gpus]
+
+
 def is_training_command(argv):
     if not argv:
         return False
@@ -61,9 +74,9 @@ def is_training_command(argv):
                 if not arg.startswith("--") and "c" in arg[1:]:
                     return False
                 continue
-            return Path(arg).name == LAUNCHER.name
+            return Path(arg).name in (LAUNCHER.name, "run_emoset_draft_grpo.sh")
         return False
-    return executable == LAUNCHER.name
+    return executable in (LAUNCHER.name, "run_emoset_draft_grpo.sh")
 
 
 def existing_training():
@@ -77,17 +90,18 @@ def existing_training():
                 continue
             argv = (proc / "cmdline").read_bytes().decode(errors="replace").split("\0")
             argv = [arg for arg in argv if arg]
-        except FileNotFoundError:
+        except OSError:
             continue
         if is_training_command(argv):
             found.append(int(proc.name))
     return found
 
 
-def wait_and_run(status_path, training_log):
-    state = {"watcher_pid": os.getpid(), "launcher": str(LAUNCHER),
+def wait_and_run(status_path, training_log, *, launcher=LAUNCHER, requested_gpus=None, state_metadata=None):
+    state = {**(state_metadata or {}), "watcher_pid": os.getpid(), "launcher": str(launcher),
              "training_log": str(training_log), "launch_attempted": False,
-             "poll_seconds": POLL_SECONDS}
+             "poll_seconds": POLL_SECONDS,
+             "requested_gpus": list(requested_gpus) if requested_gpus is not None else None}
 
     def record(status, **updates):
         state.update(status=status, updated_at=datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
@@ -112,12 +126,12 @@ def wait_and_run(status_path, training_log):
             try:
                 snapshot = gpu_snapshot()
                 available = idle_gpus(snapshot)
+                selected = select_gpus(snapshot, requested_gpus)
                 record("waiting", gpu_snapshot=snapshot,
                        available_gpus=[gpu["index"] for gpu in available], query_error=None)
-                if len(available) < 2:
+                if not selected:
                     time.sleep(POLL_SECONDS)
                     continue
-                selected = available[:2]
                 time.sleep(CONFIRM_SECONDS)
                 confirmed = {gpu["uuid"]: gpu for gpu in idle_gpus(gpu_snapshot())}
                 if not all(gpu["uuid"] in confirmed
@@ -135,7 +149,7 @@ def wait_and_run(status_path, training_log):
             devices = ",".join(str(gpu["index"]) for gpu in selected)
             environment = os.environ.copy()
             environment["CUDA_VISIBLE_DEVICES"] = devices
-            command = ["bash", str(LAUNCHER)]
+            command = ["bash", str(launcher)]
             record("starting", launch_attempted=True, cuda_visible_devices=devices,
                    selected_gpu_uuids=[gpu["uuid"] for gpu in selected], command=command)
             with training_log.open("a") as output:

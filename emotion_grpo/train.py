@@ -27,9 +27,11 @@ def prompt_contract(config: DictConfig | None = None) -> dict:
         contract.update({
             "schema_version": 2,
             "method": "draft_grpo_v1",
+            "invalid_draft_policy": "all_suffix_preserve_sample_v1",
             "reward": "single_boxed_correct_label_0_or_1_v1",
             "warmup": {
                 "steps_per_launch": draft.warmup_steps,
+                "on_resume": draft.get("warmup_on_resume", False),
                 "adv_estimator": "grpo",
                 "reward": "strict_angles_correct_label_0_or_1_v1",
             },
@@ -69,7 +71,15 @@ def check_checkpoint_prompt(config: DictConfig) -> dict:
                     "Use a new trainer.experiment_name to train with the current prompt."
                 )
             continue
-        if json.loads(path.read_text(encoding="utf-8")) != expected:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        comparable = saved
+        # Resume warmup is a launch policy, not part of the saved estimator.
+        # Old contracts omitted on_resume (and always warmed up); permit this
+        # one policy to change while still checking every other contract field.
+        if (expected["schema_version"] == 2 and isinstance(saved, dict)
+                and isinstance(saved.get("warmup"), dict)):
+            comparable = {**saved, "warmup": {**saved["warmup"], "on_resume": expected["warmup"]["on_resume"]}}
+        if comparable != expected:
             raise ValueError(
                 f"Checkpoint prompt/reward contract does not match the current angles recipe: {path}. "
                 "Use a new trainer.experiment_name."
@@ -115,8 +125,10 @@ def check_config(config: DictConfig) -> None:
                 raise ValueError(f"Draft GRPO requires {key}=2.")
         if rollout.n != 4:
             raise ValueError("Draft GRPO requires rollout.n=4 for its 2 x 2 leaves.")
-        if draft.get("warmup_steps") != 10:
-            raise ValueError("Draft GRPO requires warmup_steps=10 on every launch, including resume.")
+        if draft.get("warmup_steps") != 20:
+            raise ValueError("Draft GRPO requires warmup_steps=20 for fresh-run warmup.")
+        if not isinstance(draft.get("warmup_on_resume", False), bool):
+            raise ValueError("Draft GRPO requires a boolean warmup_on_resume.")
         for key in ("ema_beta", "shrink_min", "eps"):
             value = draft.get(key)
             if not isinstance(value, (int, float)) or not math.isfinite(value):

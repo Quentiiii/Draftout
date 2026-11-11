@@ -20,7 +20,8 @@ DRAFT_SETTINGS = {
     "ema_beta": 0.9,
     "shrink_min": 0.1,
     "eps": 1.0e-6,
-    "warmup_steps": 10,
+    "warmup_steps": 20,
+    "warmup_on_resume": False,
 }
 
 
@@ -105,8 +106,12 @@ class DraftResumeContractTests(unittest.TestCase):
         current = check_checkpoint_prompt(self.config)
         self.assertEqual(current["schema_version"], 2)
         self.assertEqual(current["method"], "draft_grpo_v1")
-        self.assertEqual(current["warmup"]["steps_per_launch"], 10)
-        self.assertEqual(current["draft_grpo"], {k: v for k, v in DRAFT_SETTINGS.items() if k != "warmup_steps"})
+        self.assertEqual(current["invalid_draft_policy"], "all_suffix_preserve_sample_v1")
+        self.assertEqual(current["warmup"]["steps_per_launch"], 20)
+        self.assertFalse(current["warmup"]["on_resume"])
+        self.assertEqual(current["draft_grpo"], {
+            k: v for k, v in DRAFT_SETTINGS.items() if k not in ("warmup_steps", "warmup_on_resume")
+        })
         self.assertFalse(self.directory.exists())
 
     def test_draft_resume_rejects_old_method_even_with_identical_prompt(self):
@@ -114,14 +119,36 @@ class DraftResumeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             check_checkpoint_prompt(self.config)
 
+    def test_previous_fail_fast_rollout_contract_is_not_silently_mixed_with_fallback(self):
+        previous = prompt_contract(self.config)
+        previous.pop("invalid_draft_policy")
+        self.write_checkpoint(contract=previous)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            check_checkpoint_prompt(self.config)
+
     def test_draft_resume_requires_matching_method_and_ema_settings(self):
         self.write_checkpoint()
         self.assertEqual(check_checkpoint_prompt(self.config), prompt_contract(self.config))
-        for key, value in (("ema_beta", 0.8), ("shrink_min", 0.2), ("eps", 1.0e-5), ("warmup_steps", 9)):
+        for key, value in (("ema_beta", 0.8), ("shrink_min", 0.2), ("eps", 1.0e-5), ("warmup_steps", 10)):
             changed = copy.deepcopy(self.config)
             changed.draft_grpo[key] = value
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "does not match"):
                 check_checkpoint_prompt(changed)
+
+    def test_resume_policy_can_change_without_rejecting_existing_checkpoint_contract(self):
+        legacy = prompt_contract(self.config)
+        legacy["warmup"].pop("on_resume")
+        self.write_checkpoint(contract=legacy)
+        source = self.directory / "prompt_contract.json"
+        before = source.read_bytes()
+        self.assertEqual(check_checkpoint_prompt(self.config), prompt_contract(self.config))
+        self.assertEqual(source.read_bytes(), before)  # Preflight never rewrites history.
+        explicit = copy.deepcopy(self.config)
+        explicit.draft_grpo.warmup_on_resume = True
+        self.assertEqual(check_checkpoint_prompt(explicit), prompt_contract(explicit))
+        legacy["warmup"]["on_resume"] = True
+        source.write_text(json.dumps(legacy))
+        self.assertEqual(check_checkpoint_prompt(self.config), prompt_contract(self.config))
 
     def test_selected_checkpoint_needs_ema_state_and_valid_tracker(self):
         checkpoint = self.write_checkpoint(state=False)
@@ -177,7 +204,8 @@ class DraftRecipeConfigTests(unittest.TestCase):
             ("draft_grpo.num_drafts", 3),
             ("draft_grpo.num_continuations_per_draft", 3),
             ("draft_grpo.warmup_steps", 0),
-            ("draft_grpo.warmup_steps", 9),
+            ("draft_grpo.warmup_steps", 10),
+            ("draft_grpo.warmup_on_resume", "false"),
             ("draft_grpo.ema_beta", 1.0),
             ("draft_grpo.ema_beta", float("nan")),
             ("draft_grpo.shrink_min", -0.1),

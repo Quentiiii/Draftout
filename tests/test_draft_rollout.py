@@ -1,6 +1,8 @@
 """CPU fake-server checks for the two-by-two rollout contract."""
 
 import asyncio
+import concurrent.futures
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -8,12 +10,14 @@ from unittest.mock import AsyncMock, Mock, patch
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from ray.exceptions import ActorDiedError, RayTaskError, WorkerCrashedError
 
 from emotion_grpo.draft_rollout import (
     DraftAgentLoopManager,
     DraftAgentLoopWorker,
     DraftImageAgent,
     DraftRolloutError,
+    _gather_settled,
     split_draft_input,
     validate_draft_prefix,
 )
@@ -106,6 +110,151 @@ def make_agent(server=None, response_length=12):
 
 
 class DraftGenerationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_observed_error_is_preserved_after_later_sibling_failure(self):
+        release = asyncio.Event()
+        failed = asyncio.Event()
+        first = DraftRolloutError("earliest failure")
+        second = RuntimeError("later failure from first input")
+
+        async def delayed_failure():
+            await release.wait()
+            raise second
+
+        async def immediate_failure():
+            failed.set()
+            raise first
+
+        pending = asyncio.create_task(_gather_settled(delayed_failure(), immediate_failure()))
+        await asyncio.wait_for(failed.wait(), timeout=2)
+        self.assertFalse(pending.done())
+        release.set()
+        with self.assertRaises(DraftRolloutError) as caught:
+            await pending
+        self.assertIs(caught.exception, first)
+
+    async def test_failed_generation_drains_inflight_drafts_and_continuations(self):
+        for stage in ("draft", "continuation"):
+            with self.subTest(stage=stage):
+                release = asyncio.Event()
+                blocked = asyncio.Event()
+                failure = DraftRolloutError(f"original {stage} failure")
+
+                class RacingServer(FakeServer):
+                    def __init__(self):
+                        super().__init__()
+                        self.stage_calls = 0
+                        self.finished_sibling = False
+
+                    async def generate(self, **kwargs):
+                        is_draft = bool(kwargs["sampling_params"].get("stop"))
+                        if is_draft == (stage == "draft"):
+                            index = self.stage_calls
+                            self.stage_calls += 1
+                            if index == 0:
+                                raise failure
+                            if index == 1:
+                                blocked.set()
+                                await release.wait()
+                                self.finished_sibling = True
+                        return await super().generate(**kwargs)
+
+                server = RacingServer()
+                agent = make_agent(server)
+                with self.assertLogs("emotion_grpo.draft_rollout", level="ERROR"):
+                    pending = asyncio.create_task(agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="race"))
+                    try:
+                        await asyncio.wait_for(blocked.wait(), timeout=2)
+                        await asyncio.sleep(0)
+                        self.assertFalse(pending.done(), "Failure escaped while another server request was active")
+                        self.assertFalse(server.finished_sibling)
+                    finally:
+                        release.set()
+                    with self.assertRaises(DraftRolloutError) as caught:
+                        await pending
+                self.assertIs(caught.exception, failure)
+                self.assertTrue(server.finished_sibling)
+                self.assertEqual(server.stage_calls, 2 if stage == "draft" else 4)
+
+    async def test_caller_cancellation_does_not_cancel_or_abandon_server_requests(self):
+        release = asyncio.Event()
+        both_started = asyncio.Event()
+        started, finished = [], []
+
+        class BlockingServer(FakeServer):
+            async def generate(self, **kwargs):
+                started.append(kwargs["request_id"])
+                if len(started) == 2:
+                    both_started.set()
+                await release.wait()
+                result = await super().generate(**kwargs)
+                finished.append(kwargs["request_id"])
+                return result
+
+        agent = make_agent(BlockingServer())
+        pending = asyncio.create_task(agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="cancel"))
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=2)
+            pending.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(pending.done())
+            self.assertEqual(finished, [])
+        finally:
+            release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertCountEqual(finished, started)
+        self.assertEqual(len(started), 2, "Cancelled requests must not be reissued or continued")
+
+    async def test_backend_image_failure_waits_for_other_images_and_logs_original_error(self):
+        release = asyncio.Event()
+        suffix_started = asyncio.Event()
+        completed_suffixes = []
+
+        class SlowImageServer(FakeServer):
+            async def generate(self, **kwargs):
+                if not kwargs["sampling_params"].get("stop"):
+                    suffix_started.set()
+                    await release.wait()
+                    completed_suffixes.append(kwargs["request_id"])
+                return await super().generate(**kwargs)
+
+        class AbortedServer(FakeServer):
+            async def generate(self, **kwargs):
+                result = await super().generate(**kwargs)
+                result.stop_reason = "aborted"
+                return result
+
+        bad_agent = make_agent(AbortedServer())
+        slow_agent = make_agent(SlowImageServer())
+        worker = object.__new__(DraftAgentLoopWorker)
+        worker.config = configuration()
+        worker.config.data = {}
+        worker.tokenizer = TinyTokenizer()
+        worker.processor = None
+        worker.dataset_cls = object
+        worker.server_manager = object()
+        worker._agent_loop_postprocess = AsyncMock(side_effect=lambda trajectory, **kwargs: trajectory)
+        batch = DataProto.from_dict(non_tensors={
+            "uid": np.array(["bad-image", "slow-image"], dtype=object),
+            "raw_prompt": np.array([[], []], dtype=object),
+        }, meta_info={"draft_rollout": True, "global_steps": 15})
+        with patch("emotion_grpo.draft_rollout.DraftImageAgent", side_effect=[bad_agent, slow_agent]):
+            with self.assertLogs("emotion_grpo.draft_rollout", level="ERROR") as captured:
+                pending = asyncio.create_task(worker.generate_draft_sequences(batch))
+                try:
+                    await asyncio.wait_for(suffix_started.wait(), timeout=2)
+                    await asyncio.sleep(0)
+                    self.assertFalse(pending.done(), "Worker failed while another image still generated")
+                    self.assertEqual(completed_suffixes, [])
+                finally:
+                    release.set()
+                with self.assertRaisesRegex(DraftRolloutError, "aborted"):
+                    await pending
+        self.assertEqual(len(completed_suffixes), 4)
+        messages = "\n".join(captured.output)
+        for detail in ("image_id=bad-image", "draft_id=0", "aborted", "global_step=15"):
+            self.assertIn(detail, messages)
+
     async def test_exact_two_by_two_shared_ids_without_another_chat_turn(self):
         agent = make_agent()
         raw_prompt = [{"role": "user", "content": "image and question"}]
@@ -125,6 +274,7 @@ class DraftGenerationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(trajectory.num_turns, 2)
             self.assertEqual(trajectory.extra_fields, {
                 "image_id": "image-a", "draft_id": j, "branch_id": k, "draft_token_count": 3,
+                "draft_fallback": False, "draft_fallback_reason": "",
             })
             self.assertEqual(trajectory.response_logprobs, [-float(token) / 100 for token in trajectory.response_ids])
             continuation = agent.server_manager.calls[2 + row]
@@ -150,12 +300,104 @@ class DraftGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(trajectory.response_logprobs is None for trajectory in trajectories))
         self.assertTrue(all(call["sampling_params"]["max_tokens"] == 1 for call in agent.server_manager.calls[2:]))
 
-    async def test_invalid_draft_fails_before_any_continuation(self):
-        server = FakeServer(draft_ids=[[10, 11, 99], [10, 15, 12]])
+    async def test_eos_without_draft_retains_original_and_samples_one_fresh_response(self):
+        initial = [30, 99]  # A complete analysis/boxed answer, with no draft tags.
+        fresh = [10, 11, 12, 31, 99]
+        server = FakeServer(draft_ids=[initial, [10, 15, 12]], suffix_ids=fresh)
         agent = make_agent(server)
-        with self.assertRaisesRegex(DraftRolloutError, "EOS"):
-            await agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="i")
+        with self.assertLogs("emotion_grpo.draft_rollout", level="WARNING") as captured:
+            output = await agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="i")
+        self.assertEqual(len(output), 4)
+        self.assertEqual(len(server.calls), 5)
+        self.assertEqual(output[0].response_ids, initial)
+        self.assertEqual(output[1].response_ids, fresh)
+        self.assertEqual(server.calls[2]["prompt_ids"], [90, 91])
+        self.assertEqual(server.calls[2]["sampling_params"]["max_tokens"], 12)
+        self.assertNotIn("stop", server.calls[2]["sampling_params"])
+        self.assertTrue(all(99 not in call["prompt_ids"] for call in server.calls))
+        self.assertEqual([row.extra_fields["draft_token_count"] for row in output], [0, 0, 3, 3])
+        self.assertEqual([row.extra_fields["draft_fallback"] for row in output], [True, True, False, False])
+        for row in output:
+            self.assertEqual(row.response_logprobs, [-float(token) / 100 for token in row.response_ids])
+            self.assertEqual(row.prompt_ids, [90, 91])
+        messages = "\n".join(captured.output)
+        for detail in ("image_id=i", "draft_id=0", "reason=", "EOS", "token_count=2", "token_tail=[30, 99]"):
+            self.assertIn(detail, messages)
+        self.assertNotIn("Traceback", messages)
+
+    async def test_malformed_unfinished_draft_continues_exact_prefix_twice_with_real_budget(self):
+        cases = [[11, 12], [10, 12], [10, 11, 14], [10, 11], [10, 11, 12, 16]]
+        for prefix in cases:
+            with self.subTest(prefix=prefix):
+                server = FakeServer(draft_ids=[prefix, [10, 15, 12]])
+                agent = make_agent(server)
+                with self.assertLogs("emotion_grpo.draft_rollout", level="WARNING"):
+                    output = await agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="i")
+                self.assertEqual(len(output), 4)
+                self.assertEqual(len(server.calls), 6)
+                for branch in range(2):
+                    row = output[branch]
+                    self.assertEqual(row.response_ids[:len(prefix)], prefix)
+                    self.assertEqual(row.extra_fields["draft_token_count"], 0)
+                    self.assertTrue(row.extra_fields["draft_fallback"])
+                    self.assertTrue(row.extra_fields["draft_fallback_reason"])
+                    self.assertEqual(row.response_logprobs, [-float(token) / 100 for token in row.response_ids])
+                    call = server.calls[2 + branch]
+                    self.assertEqual(call["prompt_ids"], [90, 91] + prefix)
+                    self.assertEqual(call["sampling_params"]["max_tokens"], 12 - len(prefix))
+                    self.assertNotIn("stop", call["sampling_params"])
+
+    async def test_empty_initial_draft_samples_two_full_responses_without_revalidation(self):
+        server = FakeServer(draft_ids=[[], [10, 15, 12]], suffix_ids=[10, 11, 12, 30, 99])
+        agent = make_agent(server)
+        with self.assertLogs("emotion_grpo.draft_rollout", level="WARNING"):
+            output = await agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="empty")
+        self.assertEqual(len(server.calls), 6)
+        self.assertEqual(len(output), 4)
+        for branch in range(2):
+            self.assertEqual(server.calls[2 + branch]["prompt_ids"], [90, 91])
+            self.assertEqual(server.calls[2 + branch]["sampling_params"]["max_tokens"], 12)
+            self.assertEqual(output[branch].response_ids, [10, 11, 12, 30, 99])
+            self.assertEqual(output[branch].extra_fields["draft_token_count"], 0)
+            self.assertTrue(output[branch].extra_fields["draft_fallback"])
+            self.assertEqual(output[branch].response_logprobs, [-float(token) / 100 for token in output[branch].response_ids])
+
+    async def test_truncated_invalid_draft_preserves_all_tokens_and_one_token_suffix_budget(self):
+        prefix = [10, 11, 15]
+        server = FakeServer(logprobs=False, draft_ids=[prefix, [10, 15, 12]], suffix_ids=[30])
+        agent = make_agent(server, response_length=4)
+        with self.assertLogs("emotion_grpo.draft_rollout", level="WARNING"):
+            output = await agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="cutoff")
+        self.assertEqual(len(server.calls), 6)
+        for row in output[:2]:
+            self.assertEqual(row.response_ids, prefix + [30])
+            self.assertEqual(row.extra_fields["draft_token_count"], 0)
+            self.assertIsNone(row.response_logprobs)
+        self.assertTrue(all(call["sampling_params"]["max_tokens"] == 1 for call in server.calls[2:]))
+
+    async def test_over_budget_initial_generation_is_a_backend_error_not_format_fallback(self):
+        server = FakeServer(draft_ids=[[30] * 12, [10, 15, 12]])
+        agent = make_agent(server)
+        with self.assertLogs("emotion_grpo.draft_rollout", level="ERROR"), \
+                self.assertRaisesRegex(DraftRolloutError, "exceeded.*max_tokens"):
+            await agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="overflow")
         self.assertEqual(len(server.calls), 2)
+
+    async def test_fallback_with_empty_fresh_response_is_still_a_backend_error(self):
+        server = FakeServer(draft_ids=[[], [10, 15, 12]])
+        original = server.generate
+
+        async def empty_continuation(**kwargs):
+            result = await original(**kwargs)
+            if not kwargs["sampling_params"].get("stop"):
+                result.token_ids, result.log_probs = [], []
+            return result
+
+        server.generate = empty_continuation
+        with self.assertLogs("emotion_grpo.draft_rollout", level="WARNING"), \
+                self.assertRaisesRegex(DraftRolloutError, "Continuation returned no tokens"):
+            await make_agent(server).run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="empty-backend")
+        self.assertEqual(len(server.calls), 6)
 
     async def test_invalid_generation_limits_are_explicit_errors(self):
         for case in ("temperature", "context", "empty_suffix", "long_suffix"):
@@ -200,6 +442,86 @@ class DraftGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(batch.non_tensor_batch["draft_token_count"].tolist(), [3] * 4)
         self.assertEqual(batch.non_tensor_batch["draft_id"].tolist(), [0, 0, 1, 1])
         self.assertEqual(batch.non_tensor_batch["branch_id"].tolist(), [0, 1, 0, 1])
+
+    async def test_fallback_uses_existing_postprocess_with_variable_lengths_and_metadata(self):
+        from emotion_grpo.draft_training import DraftTrainingController
+        from emotion_grpo.reward import compute_draft_score
+
+        class EmotionTokenizer(TinyTokenizer):
+            pieces = {**TinyTokenizer.pieces, 30: "Analysis \\boxed{Amusement}", 31: "Analysis \\boxed{Sadness}"}
+
+            def decode(self, ids, **kwargs):
+                if kwargs.get("skip_special_tokens"):
+                    ids = [token for token in ids if token not in (self.eos_token_id, self.pad_token_id)]
+                return super().decode(ids, **kwargs)
+
+        class AlternatingRewardServer(FakeServer):
+            async def generate(self, **kwargs):
+                suffix_index = self.suffix_count
+                result = await super().generate(**kwargs)
+                if not kwargs["sampling_params"].get("stop"):
+                    # Fresh fallback: wrong; normal draft continuations: right,
+                    # wrong. Together with the preserved answer: [1,0,1,0].
+                    result.token_ids = [31 if suffix_index % 2 == 0 else 30, 99]
+                    result.log_probs = [-float(token) / 100 for token in result.token_ids]
+                return result
+
+        server = AlternatingRewardServer(draft_ids=[[30, 99], [10, 15, 12]])
+        agent = make_agent(server)
+        agent.tokenizer = EmotionTokenizer()
+        with self.assertLogs("emotion_grpo.draft_rollout", level="WARNING"):
+            trajectories = await agent.run_draft_rollout({"temperature": 1.0}, raw_prompt=[], uid="i")
+        worker = object.__new__(DraftAgentLoopWorker)
+        worker.config = configuration()
+        worker.tokenizer = agent.tokenizer
+        worker.processor = None
+        worker.reward_router_address = None
+        worker.use_reward_loop = False
+        processed = [await worker._agent_loop_postprocess(row, raw_prompt=[]) for row in trajectories]
+        batch = worker._postprocess(processed)
+        self.assertEqual(tuple(batch.batch["input_ids"].shape), (4, 17))
+        self.assertEqual(batch.batch["prompts"].tolist(), [[0, 0, 0, 90, 91]] * 4)
+        self.assertEqual(batch.batch["response_mask"].sum(dim=1).tolist(), [2, 2, 5, 5])
+        for index, row in enumerate(trajectories):
+            length = len(row.response_ids)
+            self.assertEqual(batch.batch["responses"][index, :length].tolist(), row.response_ids)
+            self.assertEqual(row.response_ids[-1], 99)
+            self.assertEqual(batch.batch["response_mask"][index, length:].tolist(), [0] * (12 - length))
+        self.assertEqual(batch.non_tensor_batch["draft_token_count"].tolist(), [0, 0, 3, 3])
+        self.assertEqual(batch.non_tensor_batch["draft_fallback"].tolist(), [True, True, False, False])
+        reasons = batch.non_tensor_batch["draft_fallback_reason"].tolist()
+        self.assertEqual(reasons[0], reasons[1])
+        self.assertTrue(reasons[0])
+        self.assertEqual(reasons[2:], ["", ""])
+
+        rewards = [
+            compute_draft_score(
+                "emoset", agent.tokenizer.decode(row.response_ids, skip_special_tokens=True), "Amusement",
+                extra_info={"draft_grpo_warmup": False},
+            )
+            for row in trajectories
+        ]
+        self.assertEqual([reward["score"] for reward in rewards], [1, 0, 1, 0])
+        self.assertEqual([reward["task_reward"] for reward in rewards], [1, 0, 1, 0])
+        scores = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        for index, row in enumerate(trajectories):
+            scores[index, len(row.response_ids) - 1] = rewards[index]["task_reward"]
+        batch.batch["token_level_scores"] = scores
+        batch.batch["token_level_rewards"] = scores.clone()
+        controller = DraftTrainingController({})
+        controller.begin_session(0)
+        batch, metrics = controller.compute_advantage(batch, global_step=21)
+        advantages = batch.batch["advantages"]
+        self.assertEqual(advantages.dtype, torch.bfloat16)
+        for row, signed_value in enumerate((0.5, -0.5, 0.5, -0.5)):
+            length = len(trajectories[row].response_ids)
+            draft_length = trajectories[row].extra_fields["draft_token_count"]
+            self.assertEqual(advantages[row, :draft_length].tolist(), [0.0] * draft_length)
+            self.assertEqual(advantages[row, draft_length:length].tolist(), [signed_value] * (length - draft_length))
+            self.assertEqual(advantages[row, length:].tolist(), [0.0] * (12 - length))
+        self.assertEqual(metrics["draft/fallback_draft_count"], 1)
+        self.assertEqual(metrics["draft/fallback_draft_fraction"], 0.5)
+        self.assertEqual(metrics["draft/warmup"], 0.0)
 
     async def test_worker_preserves_image_order_and_original_reward_kwargs(self):
         worker = object.__new__(DraftAgentLoopWorker)
@@ -320,10 +642,98 @@ class DraftDispatchTests(unittest.TestCase):
         manager.wake_up.assert_called_once()
         manager.sleep.assert_called_once()
         manager.sleep.reset_mock()
-        with patch("emotion_grpo.draft_rollout.ray.get", side_effect=DraftRolloutError("draft invalid")):
+        with patch("emotion_grpo.draft_rollout.ray.get", side_effect=DraftRolloutError("draft invalid")), \
+                patch("emotion_grpo.draft_rollout.ray.wait", side_effect=lambda refs, **kwargs: (refs, [])), \
+                self.assertLogs("emotion_grpo.draft_rollout", level="ERROR"):
             with self.assertRaisesRegex(DraftRolloutError, "invalid"):
                 manager.generate_sequences(repeated_images())
         manager.sleep.assert_called_once()
+
+    def test_failed_worker_cannot_sleep_until_sibling_completes_and_cleanup_preserves_original(self):
+        manager = object.__new__(DraftAgentLoopManager)
+        manager.config = configuration()
+        manager.wake_up = Mock()
+        manager.sleep = Mock(side_effect=RuntimeError("secondary rollout cleanup failure"))
+        manager.reward_model_manager = SimpleNamespace(
+            wake_up=Mock(), sleep=Mock(side_effect=RuntimeError("secondary reward cleanup failure"))
+        )
+        original = DraftRolloutError("first worker failure")
+        failed, running = concurrent.futures.Future(), concurrent.futures.Future()
+        failed.set_exception(original)
+        manager.agent_loop_workers = [
+            SimpleNamespace(generate_draft_sequences=SimpleNamespace(remote=Mock(return_value=ref)))
+            for ref in (failed, running)
+        ]
+        drain_started = threading.Event()
+
+        def get(refs):
+            if isinstance(refs, list):
+                return [ref.result() for ref in refs]
+            return refs.result()
+
+        def wait(refs, **kwargs):
+            self.assertEqual(kwargs, {"num_returns": 2, "fetch_local": False})
+            drain_started.set()
+            concurrent.futures.wait(refs)
+            return refs, []
+
+        with patch("emotion_grpo.draft_rollout.ray.get", side_effect=get), \
+                patch("emotion_grpo.draft_rollout.ray.wait", side_effect=wait), \
+                self.assertLogs("emotion_grpo.draft_rollout", level="ERROR") as captured:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(manager.generate_sequences, repeated_images(num_images=2))
+                try:
+                    self.assertTrue(drain_started.wait(timeout=2))
+                    self.assertFalse(pending.done())
+                    manager.sleep.assert_not_called()
+                    manager.reward_model_manager.sleep.assert_not_called()
+                finally:
+                    running.set_result(object())
+                with self.assertRaises(DraftRolloutError) as caught:
+                    pending.result(timeout=2)
+        self.assertIs(caught.exception, original)
+        manager.sleep.assert_called_once()
+        manager.reward_model_manager.sleep.assert_called_once()
+        self.assertIn("secondary rollout cleanup failure", "\n".join(captured.output))
+        self.assertIn("secondary reward cleanup failure", "\n".join(captured.output))
+
+    def test_unconfirmed_worker_completion_skips_gpu_sleep(self):
+        manager = object.__new__(DraftAgentLoopManager)
+        manager.config = configuration()
+        manager.wake_up = Mock()
+        manager.sleep = Mock()
+        manager.reward_model_manager = None
+        manager.agent_loop_workers = [
+            SimpleNamespace(generate_draft_sequences=SimpleNamespace(remote=Mock(return_value=object())))
+        ]
+        original = DraftRolloutError("original generation failure")
+        with patch("emotion_grpo.draft_rollout.ray.get", side_effect=original), \
+                patch("emotion_grpo.draft_rollout.ray.wait", side_effect=RuntimeError("Ray unavailable")), \
+                self.assertLogs("emotion_grpo.draft_rollout", level="ERROR"):
+            with self.assertRaises(DraftRolloutError) as caught:
+                manager.generate_sequences(repeated_images(num_images=1))
+        self.assertIs(caught.exception, original)
+        manager.sleep.assert_not_called()
+
+    def test_ready_ref_from_dead_worker_is_not_evidence_of_drained_server_requests(self):
+        task_error = RayTaskError("generate", "Traceback: invalid draft", DraftRolloutError("invalid"), ip="127.0.0.1")
+        for error, should_sleep in ((ActorDiedError(), False), (WorkerCrashedError(), False), (task_error, True)):
+            with self.subTest(error=type(error).__name__):
+                manager = object.__new__(DraftAgentLoopManager)
+                manager.config = configuration()
+                manager.wake_up = Mock()
+                manager.sleep = Mock()
+                manager.reward_model_manager = None
+                manager.agent_loop_workers = [
+                    SimpleNamespace(generate_draft_sequences=SimpleNamespace(remote=Mock(return_value=object())))
+                ]
+                with patch("emotion_grpo.draft_rollout.ray.get", side_effect=error), \
+                        patch("emotion_grpo.draft_rollout.ray.wait", side_effect=lambda refs, **kwargs: (refs, [])), \
+                        self.assertLogs("emotion_grpo.draft_rollout", level="ERROR"):
+                    with self.assertRaises(type(error)) as caught:
+                        manager.generate_sequences(repeated_images(num_images=1))
+                self.assertIs(caught.exception, error)
+                self.assertEqual(manager.sleep.call_count, int(should_sleep))
 
 
 if __name__ == "__main__":

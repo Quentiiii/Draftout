@@ -12,7 +12,7 @@ import torch
 from emotion_grpo.draft_advantage import DraftAdvantageEstimator, compute_draft_advantages
 
 
-def make_batch(rewards, *, order=None):
+def make_batch(rewards, *, order=None, draft_counts=None):
     rewards = torch.as_tensor(rewards, dtype=torch.float32)
     image_count = rewards.shape[0]
     rows = image_count * 4
@@ -22,7 +22,7 @@ def make_batch(rewards, *, order=None):
     metadata = {key: [] for key in ("image_id", "draft_id", "branch_id", "draft_token_count")}
     for image, draft, branch in itertools.product(range(image_count), range(2), range(2)):
         row = image * 4 + draft * 2 + branch
-        draft_count = 2 + draft
+        draft_count = 2 + draft if draft_counts is None else draft_counts[image][draft]
         active_count = 6 + branch
         responses[row, :draft_count] = torch.arange(draft_count) + 10 * image + 3 * draft + 1
         responses[row, draft_count:active_count] = 50 + branch
@@ -144,6 +144,97 @@ class DraftEstimatorTests(unittest.TestCase):
                 atol=0,
             )
 
+    def test_mixed_fallback_uses_raw_suffix_and_preserves_normal_prefixes_statistics_and_order(self):
+        rewards = [[[1, 1], [0, 0]], [[1, 0], [0, 0]]]
+        draft_counts = [[0, 3], [2, 0]]
+        normal_estimator = DraftAdvantageEstimator()
+        normal, normal_metrics = normal_estimator.compute(make_batch(rewards))
+        fallback_estimator = DraftAdvantageEstimator()
+        fallback = make_batch(rewards, draft_counts=draft_counts)
+        fallback.batch["token_level_scores"].requires_grad_()
+        prompt_before = fallback.batch["input_ids"].clone()
+        fallback, metrics = fallback_estimator.compute(fallback)
+        self.assertEqual(fallback_estimator.state_dict(), normal_estimator.state_dict())
+        for key in normal_metrics:
+            if not key.startswith("draft/fallback_"):
+                self.assertEqual(metrics[key], normal_metrics[key])
+        self.assertEqual(metrics["draft/fallback_draft_count"], 2)
+        self.assertEqual(metrics["draft/fallback_draft_fraction"], 0.5)
+        segment = compute_draft_advantages(torch.tensor(rewards), metrics["draft/s"])
+        self.assertNotEqual(float(segment["draft_adv"][0, 0]), 0)
+        for row in range(8):
+            image, remaining = divmod(row, 4)
+            draft, branch = divmod(remaining, 2)
+            length = int(fallback.batch["response_mask"][row].sum())
+            if draft_counts[image][draft] == 0:
+                expected = segment["suffix_adv"][image, draft, branch]
+                self.assertTrue(torch.all(fallback.batch["advantages"][row, :length] == expected))
+            else:
+                torch.testing.assert_close(
+                    fallback.batch["advantages"][row], normal.batch["advantages"][row], rtol=0, atol=0
+                )
+            self.assertEqual(float(fallback.batch["advantages"][row, length:].abs().sum()), 0)
+        torch.testing.assert_close(fallback.batch["input_ids"], prompt_before, rtol=0, atol=0)
+        self.assertFalse(fallback.batch["advantages"].requires_grad)
+        self.assertIsNone(fallback.batch["token_level_scores"].grad)
+        order = [7, 2, 0, 5, 3, 4, 1, 6]
+        reordered, reordered_metrics = DraftAdvantageEstimator().compute(
+            make_batch(rewards, order=order, draft_counts=draft_counts)
+        )
+        self.assertEqual(reordered_metrics, metrics)
+        torch.testing.assert_close(
+            reordered.batch["advantages"], fallback.batch["advantages"][order], rtol=0, atol=0
+        )
+
+    def test_all_fallback_responses_include_first_token_and_eos_with_zero_padding_gradient(self):
+        rewards = [[[1, 0], [1, 0]]]
+        batch, metrics = DraftAdvantageEstimator().compute(make_batch(rewards, draft_counts=[[0, 0]]))
+        self.assertEqual(metrics["draft/fallback_draft_count"], 2)
+        self.assertEqual(metrics["draft/fallback_draft_fraction"], 1)
+        expected_per_row = torch.tensor([0.5, -0.5, 0.5, -0.5], dtype=torch.bfloat16)
+        expected = expected_per_row[:, None] * batch.batch["response_mask"].to(torch.bfloat16)
+        torch.testing.assert_close(batch.batch["advantages"], expected, rtol=0, atol=0)
+        torch.testing.assert_close(batch.batch["returns"], expected, rtol=0, atol=0)
+        # The response-only policy objective propagates through the first token
+        # and EOS, while padding and prompt positions receive zero gradient.
+        logprobs = torch.zeros_like(batch.batch["input_ids"], dtype=torch.float32, requires_grad=True)
+        loss = -(logprobs[:, -8:] * batch.batch["advantages"]).sum()
+        loss.backward()
+        torch.testing.assert_close(logprobs.grad[:, -8:], -expected.float(), rtol=0, atol=0)
+        self.assertEqual(torch.count_nonzero(logprobs.grad[:, :-8]).item(), 0)
+
+    def test_fallback_count_mismatch_negative_full_length_and_empty_response_are_rejected(self):
+        for problem in ("mixed_zero_and_positive", "negative", "full_length", "empty"):
+            with self.subTest(problem=problem):
+                batch = make_batch([[[1, 0], [0, 0]]], draft_counts=[[0, 3]])
+                if problem == "mixed_zero_and_positive":
+                    batch.non_tensor_batch["draft_token_count"][1] = 1
+                elif problem == "negative":
+                    batch.non_tensor_batch["draft_token_count"][0] = -1
+                elif problem == "full_length":
+                    batch.non_tensor_batch["draft_token_count"][0] = 6
+                else:
+                    batch.batch["response_mask"][0] = 0
+                    batch.batch["token_level_scores"][0] = 0
+                estimator = DraftAdvantageEstimator()
+                with self.assertRaises(ValueError):
+                    estimator.compute(batch)
+                self.assertEqual(estimator.num_updates, 0)
+
+    def test_single_eos_fallback_response_is_nonempty_and_uses_suffix_advantage(self):
+        batch = make_batch([[[1, 0], [1, 0]]], draft_counts=[[0, 0]])
+        batch.batch["responses"][:, 0] = 99
+        batch.batch["response_mask"][:, 1:] = 0
+        batch.batch["token_level_scores"].zero_()
+        batch.batch["token_level_scores"][:, 0] = torch.tensor([1, 0, 1, 0])
+        batch, metrics = DraftAdvantageEstimator().compute(batch)
+        torch.testing.assert_close(
+            batch.batch["advantages"][:, 0], torch.tensor([0.5, -0.5, 0.5, -0.5], dtype=torch.bfloat16),
+            rtol=0, atol=0,
+        )
+        self.assertEqual(torch.count_nonzero(batch.batch["advantages"][:, 1:]).item(), 0)
+        self.assertEqual(metrics["draft/fallback_draft_count"], 2)
+
     def test_metadata_shape_duplicates_and_prefix_errors_fail_without_updating_ema(self):
         def missing_field(batch):
             del batch.non_tensor_batch["draft_id"]
@@ -219,7 +310,9 @@ class DraftEstimatorTests(unittest.TestCase):
     def test_distributed_statistics_reduce_sums_and_image_counts_not_rank_means(self):
         local_rewards = [[[1, 1], [0, 0]]]
         remote_rewards = [[[1, 0], [1, 0]], [[0, 0], [0, 0]]]
-        whole, expected_metrics = DraftAdvantageEstimator().compute(make_batch(local_rewards + remote_rewards))
+        whole, expected_metrics = DraftAdvantageEstimator().compute(
+            make_batch(local_rewards + remote_rewards, draft_counts=[[0, 3], [0, 0], [0, 3]])
+        )
         calls = []
 
         def reduce_remote(tensor, *, op, group):
@@ -228,7 +321,8 @@ class DraftEstimatorTests(unittest.TestCase):
                 # Remote ranks contribute within-image sums and total rewards.
                 tensor.add_(torch.tensor([0, 1, 2], dtype=torch.bfloat16))
             elif len(calls) == 2:
-                tensor.add_(2)  # Two remote images versus one local image.
+                # Two remote images and three fallback groups versus one and one locally.
+                tensor.add_(torch.tensor([2, 3], dtype=torch.int64))
             elif len(calls) == 3:
                 # Equal means imply zero remote draft advantage and suffix |A|=2.
                 tensor.add_(torch.tensor([0, 2], dtype=torch.bfloat16))
@@ -240,8 +334,12 @@ class DraftEstimatorTests(unittest.TestCase):
             patch("emotion_grpo.draft_advantage.dist.is_initialized", return_value=True),
             patch("emotion_grpo.draft_advantage.dist.all_reduce", side_effect=reduce_remote),
         ):
-            local, actual_metrics = DraftAdvantageEstimator().compute(make_batch(local_rewards), global_batch=False)
+            local, actual_metrics = DraftAdvantageEstimator().compute(
+                make_batch(local_rewards, draft_counts=[[0, 3]]), global_batch=False
+            )
         self.assertEqual(actual_metrics, expected_metrics)
+        self.assertEqual(actual_metrics["draft/fallback_draft_count"], 4)
+        self.assertEqual(actual_metrics["draft/fallback_draft_fraction"], 4 / 6)
         torch.testing.assert_close(local.batch["advantages"], whole.batch["advantages"][:4], rtol=0, atol=0)
         self.assertEqual([call[0] for call in calls], [torch.bfloat16, torch.int64, torch.bfloat16])
 

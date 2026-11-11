@@ -461,19 +461,42 @@ checkpoint、专属数据、日志、诊断及旧 GRPO 测试集评测结果；�
 
 入口是 `scripts/run_emoset_draft_grpo.sh`，复用原训练脚本、数据、vLLM rollout、
 奖励接口和 PPO clipped loss。配置位于 `verl/trainer/config/emoset_draft_grpo.yaml`，
-独立实验目录为 `outputs/emoset_grpo/checkpoints/emoset_draft_grpo_2b_2k/`。
+独立实验目录为 `outputs/emoset_grpo/checkpoints/emoset_draft_grpo_2b_2k_warmup20_fallback/`。
+20 步预热和格式兜底使用新目录，避免与旧实验的方法契约冲突；原实验结果保留。
 原来的 `run_emoset_grpo.sh` 仍可用于普通 GRPO。
 
-使用当前 `EMOTION_ANALYSIS_DRAFT_PROMPT`。**每次启动，包括断点恢复，先完成 10 次普通
-GRPO 更新**，使用原严格格式且分类正确才得 1 分的奖励；这 10 步计入累计 `global_step`。
-随后自动切到Draft GRPO 阶段。例如恢复第 375 步时，376–385 为 warmup，386 开始draft 与后缀采样。
+使用当前 `EMOTION_ANALYSIS_DRAFT_PROMPT`。**从头训练先完成 20 次普通 GRPO 更新**，
+使用原严格格式且分类正确才得 1 分的奖励；这 20 步计入累计 `global_step`，第 21 步切到 Draft GRPO。
+**断点恢复默认不重新预热**（`draft_grpo.warmup_on_resume=false`）：例如恢复第 100 步，
+第 101 步直接进行 Draft 更新，沿用 checkpoint 中的模型、优化器和 EMA 状态。
 验证不计入 warmup，始终使用原单回答贪心流程，并记录分类准确率及格式通过率。
 
 Draft GRPO 阶段在同一策略快照下，每图采样两个 draft，在 `</draft>` 处停止，各自沿完全相同的
 assistant token 前缀独立续写两次。中间不增加 user 消息，也不更新参数。4 条完整轨迹
 通过原图像处理和 padding 流程，再计算旧策略 log-prob 和原 PPO loss。总输出预算仍为
-1,024 tokens，由 draft 和后缀共享，包含 EOS。缺少闭标签、提前 EOS、空 draft 等情况会
-明确报错，避免补造 token 或静默丢弃样本；后缀达到长度上限时沿用原来的奖励处理。
+1,024 tokens，由 draft 和后缀共享，包含 EOS。缺少起止标签、提前 EOS、空 draft、
+标签与分析混入同一 token 等格式异常会进入兜底，`draft_token_count=0`，整条输出
+（含原先生成的标签、解释、答案和 EOS）都使用 `suffix_adv`，不分配 draft token loss。
+原始输出不会补写标签、重新编码或反复采样到格式正确：
+
+- 异常前缀未结束时，保留全部 token，沿同一个 assistant 前缀独立续写两次；剩余预算按
+  实际前缀 token 数扣除。前缀虽然共享，也属于解释/后缀，两份均使用各自的 `suffix_adv`。
+- 已 EOS 或已用完总预算时，原回答保留为 branch 0，从原始图像和问题独立生成一条
+  完整回答作为 branch 1。两条都按无 draft 处理，不复制终止回答充当两次采样。
+- 初次返回零 token 时，从原 prompt 分别生成两条完整回答。完整回答阶段不再检查 draft
+  格式；无法解析 boxed 答案仍得 0 分。后缀达到长度上限时也沿用原奖励处理。
+
+所有图片仍保留 2×2 个 ID 和 4 条轨迹，收齐后才更新模型。EOS 兜底保留的原回答已条件于
+格式失败，新增回答则来自原 prompt，因此这类组是容错近似，不再严格满足同一有效 draft
+下两次续写的统计解释；仍按原公式计入 MS_B/MS_W 和 EMA，不额外归一化或调整权重。
+`draft/fallback_draft_count` 和 `draft/fallback_draft_fraction` 按全局 batch 的 draft 组
+计数（分母为 `2B`）；rollout JSONL 保存 `draft_fallback`、`draft_fallback_reason`，并输出
+包含 image/draft ID 的警告。有效 draft 的 rollout 和 advantage 行为不变。
+
+格式兜底不会吞掉后端故障：CUDA/Ray 错误、请求被中止、超出请求预算、log-prob 长度不匹配
+或完整回答始终没有 token 等情况仍明确报错。
+任一生成任务失败时，等待其余已提交的生成任务结束后再卸载 rollout 显存，
+并记录原始异常；清理期间的错误不会覆盖最早的生成异常。
 
 Draft GRPO 阶段奖励只取唯一可解析的 `\boxed{Label}` 是否正确，格式不额外加减分。
 `image_id/draft_id/branch_id/draft_token_count` 随轨迹传递，batch 重排后仍按 ID 恢复
@@ -494,7 +517,7 @@ suffix_adv = R - value[:, :, None]
 
 统计、EMA 和分段 advantage 使用 BF16、无梯度，EMA 初值为 0。
 `num_drafts=2`、`num_continuations_per_draft=2`、`ema_beta=0.9`、`shrink_min=0.1`、
-`eps=1e-6`；本版固定 2×2 和每次启动 10 步 warmup。
+`eps=1e-6`；本版固定 2×2，从头训练时有 20 步 warmup。
 Ray driver 收齐所有 rollout worker 的轨迹后统一统计；若直接在分片调用估计器，
 `global_batch=False` 会 all-reduce 平方和与图像数，各 rank 需要持有每张图片完整的 2×2 分支。
 
@@ -503,8 +526,12 @@ prompt 不进入 response loss，padding 的 advantage 和 mask 为 0。同一 d
 均保留，沿用原 `seq-mean-token-mean` 聚合；Draft GRPO 阶段不做 GRPO group normalization、
 advantage whitening、前缀去重或阶段加权。KL 等配置继承原 recipe，当前默认关闭。
 
-每个 checkpoint 保存 `draft_advantage_state.json`，恢复时加载 EMA，并重新计 10 步 warmup。
+每个 checkpoint 保存 `draft_advantage_state.json`，恢复时加载 EMA，默认跳过 warmup。
+如需恢复旧的每次启动预热行为，可显式设置 `draft_grpo.warmup_on_resume=true`。
+是否重新预热属于当前启动策略，可兼容旧 checkpoint；prompt、奖励、EMA 参数及其他方法契约仍需匹配。
 方法契约会拒绝直接混入旧普通 GRPO checkpoint，避免相同 prompt 下混用奖励和估计器状态。
+格式兜底契约标识为 `invalid_draft_policy=all_suffix_preserve_sample_v1`，与旧的格式失败即退出
+实验分开记录。代码修改不会热更新已启动的 Ray worker，需重新启动入口后生效。
 
 ```bash
 cd /data/xiyan.zhao/work/Draftout
@@ -515,7 +542,7 @@ bash scripts/run_emoset_draft_grpo.sh --check
 # 正式训练；已有同一 Draft GRPO 实验 checkpoint 时自动恢复
 CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_emoset_draft_grpo.sh
 
-# 可选 GPU 检查：独立 smoke 实验，10 步普通 GRPO + 1 步 Draft GRPO 更新
+# 可选 GPU 检查：独立 smoke 实验，20 步普通 GRPO + 1 步 Draft GRPO 更新
 CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_emoset_draft_grpo.sh --smoke
 
 # 最小 CPU 正确性检查
@@ -530,3 +557,6 @@ Draft GRPO 入口默认单卡 batch 8、梯度累计 2；两卡每步 8 张图 /
 `draft/mean_abs_draft_adv`、`draft/mean_abs_suffix_adv`，以及 `draft/warmup`、
 `draft/session_step`。完整输出与分支 ID 写入实验目录的 `rollout/<step>.jsonl`；
 验证输出在 `validation/<step>.jsonl`。同一步恢复重评会沿用现有逻辑覆盖对应验证文件。
+正式训练与 smoke 启动会同时保存完整 stdout/stderr 到
+`outputs/emoset_grpo/logs/train_draft_日期时间_PID.log`，默认启用 `HYDRA_FULL_ERROR=1`。
+可用 `DRAFT_TRAIN_LOG` 指定日志文件；CPU 预检和数据准备不创建训练日志。

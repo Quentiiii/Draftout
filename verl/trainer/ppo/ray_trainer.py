@@ -541,7 +541,10 @@ class RayPPOTrainer:
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             # Persist enough identifiers to reconstruct each image's 2x2 draft/continuation group.
-            for key in ("image_id", "draft_id", "branch_id", "draft_token_count"):
+            for key in (
+                "image_id", "draft_id", "branch_id", "draft_token_count",
+                "draft_fallback", "draft_fallback_reason",
+            ):
                 if key in batch.non_tensor_batch:
                     reward_extra_infos_to_dump[key] = batch.non_tensor_batch[key].tolist()
             if "request_id" in batch.non_tensor_batch:
@@ -2334,8 +2337,12 @@ class RayPPOTrainer:
 
         if self.draft_training is not None:
             self.draft_training.begin_session(self.global_steps)
-            print(f"Draft GRPO: ordinary GRPO for steps {self.global_steps + 1}–"
-                  f"{self.global_steps + self.draft_training.warmup_steps}; draft rollout afterwards.")
+            if self.draft_training.is_warmup(self.global_steps + 1):
+                print(f"Draft GRPO: ordinary GRPO for steps {self.global_steps + 1}–"
+                      f"{self.global_steps + self.draft_training.warmup_steps}; draft rollout afterwards.")
+            else:
+                print(f"Draft GRPO: resumed step {self.global_steps}; continue directly with draft rollout "
+                      f"at step {self.global_steps + 1}, without repeating warmup.")
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 

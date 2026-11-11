@@ -134,8 +134,8 @@ class DraftAdvantageEstimator:
                 count = operator.index(metadata["draft_token_count"][row])
             except TypeError as error:
                 raise ValueError("draft_token_count must be an integer") from error
-            if not 0 < count < active_lengths[row]:
-                raise ValueError("draft_token_count must leave a nonempty draft and suffix in every response")
+            if not 0 <= count < active_lengths[row]:
+                raise ValueError("draft_token_count must be nonnegative and leave a nonempty suffix in every response")
             counts.append(count)
         image_groups = []
         for image_id, drafts in images.items():
@@ -165,6 +165,8 @@ class DraftAdvantageEstimator:
         caller retains any separately configured PPO KL loss. All response
         tokens up to ``draft_token_count`` receive draft advantage, while every
         remaining active token (including EOS) receives suffix advantage.
+        A zero count marks a missing/invalid draft: the entire response uses
+        the same raw suffix advantage, without changing rewards or statistics.
         """
         tensors = batch.batch
         responses = tensors["responses"]
@@ -200,13 +202,22 @@ class DraftAdvantageEstimator:
                 rewards.sum(),
             )
         )
-        image_count = torch.tensor(len(image_groups), dtype=torch.int64, device=responses.device)
+        fallback_draft_count = sum(
+            operator.index(batch.non_tensor_batch["draft_token_count"][branches[0]]) == 0
+            for image_group in image_groups
+            for branches in image_group
+        )
+        counts = torch.tensor(
+            [len(image_groups), fallback_draft_count], dtype=torch.int64, device=responses.device
+        )
         if not global_batch:
             if not dist.is_available() or not dist.is_initialized():
                 raise RuntimeError("global_batch=False requires an initialized torch.distributed process group")
             dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=process_group)
+            # Count fallback draft groups once, rather than their two branches.
             # Integer counts remain exact even for large or unequal rank shards.
-            dist.all_reduce(image_count, op=dist.ReduceOp.SUM, group=process_group)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=process_group)
+        image_count, fallback_draft_count = counts.unbind()
         denominator = image_count.to(dtype=torch.bfloat16)
         ms_b = 2 * totals[0] / denominator
         ms_w = totals[1] / (2 * denominator)
@@ -244,5 +255,7 @@ class DraftAdvantageEstimator:
             "draft/ema_ms_b": float(ema_ms_b.item()),
             "draft/ema_ms_w": float(ema_ms_w.item()),
             "draft/num_images": int(image_count.item()),
+            "draft/fallback_draft_count": int(fallback_draft_count.item()),
+            "draft/fallback_draft_fraction": fallback_draft_count.item() / (2 * image_count.item()),
         }
         return batch, metrics
