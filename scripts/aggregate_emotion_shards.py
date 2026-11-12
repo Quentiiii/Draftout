@@ -8,6 +8,7 @@ import hashlib
 import json
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -67,22 +68,34 @@ def _read_predictions_snapshot(
     return records, hashlib.sha256(payload).hexdigest()
 
 
-def aggregate(input_dir: Path, data_root: Path = DEFAULT_DATA, num_shards: int = 2) -> dict:
-    """Validate every dataset before publishing complete aggregate artifacts."""
+def aggregate(
+    input_dir: Path, data_root: Path = DEFAULT_DATA, num_shards: int = 2,
+    datasets: Sequence[str] | None = None,
+) -> dict:
+    """Validate selected datasets before publishing complete aggregate artifacts."""
     if num_shards < 1:
         raise ValueError("num_shards must be positive")
+    selected_datasets = tuple(LABELS) if datasets is None else tuple(datasets)
+    if not selected_datasets or any(dataset not in LABELS for dataset in selected_datasets):
+        raise ValueError(f"datasets must select one or more of: {', '.join(LABELS)}")
+    if len(set(selected_datasets)) != len(selected_datasets):
+        raise ValueError("datasets must not contain duplicates")
     input_dir = Path(input_dir).expanduser().resolve()
     data_root = Path(data_root).expanduser().resolve()
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Missing input directory: {input_dir}")
-    datasets = {
-        "emoset": load_emoset(data_root / "EMOSET"),
-        "emotion6": load_emotion6(data_root / "Emotion6"),
-        "emo8": load_emo8(data_root / "EMO8"),
+    loaders = {
+        "emoset": (load_emoset, "EMOSET"),
+        "emotion6": (load_emotion6, "Emotion6"),
+        "emo8": (load_emo8, "EMO8"),
+    }
+    dataset_samples = {
+        dataset: loaders[dataset][0](data_root / loaders[dataset][1])
+        for dataset in selected_datasets
     }
     validated = {}
     summary = {}
-    for dataset, samples in datasets.items():
+    for dataset, samples in dataset_samples.items():
         if not samples or len({sample.sample_id for sample in samples}) != len(samples):
             raise ValueError(f"Empty or duplicate official samples for {dataset}")
         records_by_id = {}
@@ -208,9 +221,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input-dir", type=Path, required=True, help="Root containing shard_0, shard_1, ...")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA, help="Parent of EMOSET, Emotion6 and EMO8")
     parser.add_argument("--num-shards", type=int, default=2)
+    parser.add_argument("--datasets", nargs="+", choices=LABELS,
+                        help="Datasets to aggregate (default: emoset emotion6 emo8)")
     args = parser.parse_args(argv)
     try:
-        summary = aggregate(args.input_dir, args.data_root, args.num_shards)
+        summary = aggregate(args.input_dir, args.data_root, args.num_shards, datasets=args.datasets)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Aggregation failed: {exc}\n")
     for dataset, metrics in summary.items():

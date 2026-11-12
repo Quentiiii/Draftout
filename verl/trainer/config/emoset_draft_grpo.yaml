@@ -3,6 +3,9 @@ defaults:
   - _self_
 
 # Same model, data, optimizer, PPO loss aggregation and KL settings as GRPO.
+# Same sampled images, with a separate cache for EMOTION_ANALYSIS_DRAFT_PROMPT.
+data_dir: ${project_root}/outputs/emoset_grpo/data_draft_8k_seed42
+
 algorithm:
   adv_estimator: draft_grpo
   norm_adv_by_std_in_grpo: false
@@ -26,6 +29,6 @@ custom_reward_function:
   name: compute_draft_score
 
 trainer:
-  experiment_name: emoset_draft_grpo_2b_2k_warmup20_fallback
+  experiment_name: emoset_draft_grpo_2b_8k_warmup20_fallback
   # Keep leaf IDs/prefix boundaries inspectable with the existing JSONL logger.
   rollout_data_dir: ${trainer.default_local_dir}/rollout

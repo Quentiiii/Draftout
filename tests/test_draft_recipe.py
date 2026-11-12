@@ -115,7 +115,10 @@ class DraftResumeContractTests(unittest.TestCase):
         self.assertFalse(self.directory.exists())
 
     def test_draft_resume_rejects_old_method_even_with_identical_prompt(self):
-        self.write_checkpoint(contract=prompt_contract())
+        ordinary = prompt_contract()
+        draft = prompt_contract(self.config)
+        ordinary.update({key: draft[key] for key in ("prompt", "prompt_sha256")})
+        self.write_checkpoint(contract=ordinary)
         with self.assertRaisesRegex(ValueError, "does not match"):
             check_checkpoint_prompt(self.config)
 

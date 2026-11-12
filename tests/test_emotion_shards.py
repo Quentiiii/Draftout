@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,6 +119,36 @@ class AggregateShardTests(unittest.TestCase):
             self.assertEqual(len(config["shards_provenance"]), 2)
         for path, payload in originals.items():
             self.assertEqual(path.read_bytes(), payload)
+
+    def test_single_dataset_cli_needs_only_emoset_shards_and_never_loads_other_datasets(self):
+        self.use_angles_configs(sampled=False)
+        for index in range(2):
+            for dataset in ("emotion6", "emo8"):
+                shutil.rmtree(self.root / f"shard_{index}" / dataset)
+        originals = {path: path.read_bytes() for path in self.root.glob("shard_*/*/*")}
+        with (
+            patch.object(merger, "load_emotion6", side_effect=AssertionError("Emotion6 must not be loaded")),
+            patch.object(merger, "load_emo8", side_effect=AssertionError("EMO8 must not be loaded")),
+        ):
+            result = merger.main(["--input-dir", str(self.root), "--datasets", "emoset"])
+        self.assertEqual(result, 0)
+        summary = json.loads((self.root / "summary.json").read_text())
+        self.assertEqual(set(summary), {"emoset"})
+        self.assertEqual(summary["emoset"]["num_samples"], 5)
+        self.assertEqual(summary["emoset"]["accuracy"], 0.8)
+        self.assertTrue(summary["emoset"]["complete"])
+        records = [json.loads(line) for line in (self.root / "emoset/predictions.jsonl").read_text().splitlines()]
+        self.assertEqual([row["sample_id"] for row in records], [s.sample_id for s in self.datasets["emoset"]])
+        for dataset in ("emotion6", "emo8"):
+            self.assertFalse((self.root / dataset).exists())
+        for path, payload in originals.items():
+            self.assertEqual(path.read_bytes(), payload)
+
+    def test_dataset_selection_rejects_empty_unknown_or_duplicate_names(self):
+        for selection in ([], ["unknown"], ["emoset", "emoset"]):
+            with self.subTest(selection=selection), self.assertRaisesRegex(ValueError, "datasets"):
+                merger.aggregate(self.root, datasets=selection)
+            self.assert_no_aggregates()
 
     def test_sampling_shards_preserve_decoding_settings_and_provenance(self):
         self.use_sampling_configs()

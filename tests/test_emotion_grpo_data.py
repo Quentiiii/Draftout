@@ -7,14 +7,14 @@ from unittest.mock import patch
 
 from omegaconf import OmegaConf
 
-from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT
+from emotion_eval.prompts import DEEPSEEK_EMOTION_PROMPT, EMOTION_ANALYSIS_DRAFT_PROMPT, GRPO_PROMPT
 from emotion_grpo.prepare_data import (
     ARTIFACT_NAMES,
     DEFAULT_OUTPUT_DIR,
     EMOSET_LABELS,
-    PROMPT,
     SplitEntry,
     check_disjoint,
+    get_prompt,
     make_rows,
     prepare_dataset,
     read_split,
@@ -74,22 +74,24 @@ class GrpoDataTests(unittest.TestCase):
             check_disjoint({"train": train, "val": read_split(self.root, "val"), "test": [train[-1]]})
 
     def test_schema_and_prompt_do_not_leak_per_example_information(self):
-        self.assertEqual(PROMPT, "<image>\n" + EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(EMOSET_LABELS)))
-        self.assertEqual(DEFAULT_OUTPUT_DIR.name, "data_angles_concise_20261110")
+        self.assertEqual(DEFAULT_OUTPUT_DIR.name, "data_grpo_8k_seed42")
         self.write_split("train")
         selected = select_entries(read_split(self.root, "train"), 8, 42)
-        rows, manifest = make_rows(self.root, "train", selected)
-        for row, provenance in zip(rows, manifest, strict=True):
-            self.assertEqual(row["prompt"], [{"role": "user", "content": PROMPT}])
-            self.assertEqual(row["reward_model"], {"style": "rule", "ground_truth": provenance["ground_truth"]})
-            self.assertEqual(row["images"], [{
-                "image": provenance["image_path"], "min_pixels": 65536, "max_pixels": 262144,
-            }])
-            self.assertNotIn(provenance["image"], PROMPT)
-            self.assertNotIn(provenance["image_path"], PROMPT)
-            self.assertNotIn(Path(provenance["image"]).name, PROMPT)
-            self.assertEqual(PROMPT.count("<image>"), 1)
-            self.assertEqual(len(provenance["image_sha256"]), 64)
+        for style, template in (("grpo", GRPO_PROMPT), ("draft", EMOTION_ANALYSIS_DRAFT_PROMPT)):
+            prompt = "<image>\n" + template.format(labels=", ".join(EMOSET_LABELS))
+            self.assertEqual(get_prompt(style), prompt)
+            rows, manifest = make_rows(self.root, "train", selected, prompt_style=style)
+            for row, provenance in zip(rows, manifest, strict=True):
+                self.assertEqual(row["prompt"], [{"role": "user", "content": prompt}])
+                self.assertEqual(row["reward_model"], {"style": "rule", "ground_truth": provenance["ground_truth"]})
+                self.assertEqual(row["images"], [{
+                    "image": provenance["image_path"], "min_pixels": 65536, "max_pixels": 262144,
+                }])
+                self.assertNotIn(provenance["image"], prompt)
+                self.assertNotIn(provenance["image_path"], prompt)
+                self.assertNotIn(Path(provenance["image"]).name, prompt)
+                self.assertEqual(prompt.count("<image>"), 1)
+                self.assertEqual(len(provenance["image_sha256"]), 64)
 
     def test_annotation_mismatch_missing_files_and_escaping_symlinks_rejected(self):
         self.write_split("train")
@@ -120,7 +122,7 @@ class GrpoDataTests(unittest.TestCase):
         self.assertEqual(metadata["subsets"]["train"]["class_counts"], dict.fromkeys(EMOSET_LABELS, 1))
         table = pq.read_table(self.output / "train.parquet").to_pylist()
         self.assertEqual(len(table), 8)
-        self.assertEqual(table[0]["prompt"], [{"role": "user", "content": PROMPT}])
+        self.assertEqual(table[0]["prompt"], [{"role": "user", "content": get_prompt()}])
         hashes = {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES}
         mtimes = {name: (self.output / name).stat().st_mtime_ns for name in ARTIFACT_NAMES}
         self.assertEqual(metadata, prepare_dataset(**config))
@@ -138,7 +140,7 @@ class GrpoDataTests(unittest.TestCase):
             self.write_split(split)
         config = {"dataset_root": self.root, "output_dir": self.output, "train_size": 8, "val_size": 8}
         old_prompt = "<image>\n" + DEEPSEEK_EMOTION_PROMPT.format(labels=", ".join(EMOSET_LABELS))
-        with patch("emotion_grpo.prepare_data.PROMPT", old_prompt):
+        with patch("emotion_grpo.prepare_data.get_prompt", return_value=old_prompt):
             previous = prepare_dataset(**config)
         hashes = {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES}
         with self.assertRaises(FileExistsError):
@@ -146,12 +148,36 @@ class GrpoDataTests(unittest.TestCase):
         self.assertEqual(hashes, {name: sha256_file(self.output / name) for name in ARTIFACT_NAMES})
 
         current = prepare_dataset(**config, overwrite=True)
-        self.assertEqual(current["prompt"], PROMPT)
+        self.assertEqual(current["prompt"], get_prompt())
         self.assertNotEqual(previous["prompt_sha256"], current["prompt_sha256"])
         for split in ("train", "val"):
             self.assertEqual(hashes[f"{split}_manifest.jsonl"], sha256_file(self.output / f"{split}_manifest.jsonl"))
             for row in pq.read_table(self.output / f"{split}.parquet").to_pylist():
-                self.assertEqual(row["prompt"], [{"role": "user", "content": PROMPT}])
+                self.assertEqual(row["prompt"], [{"role": "user", "content": get_prompt()}])
+
+    def test_methods_share_samples_but_keep_different_prompts_and_artifacts(self):
+        import pyarrow.parquet as pq
+
+        for split in ("train", "val", "test"):
+            self.write_split(split)
+        config = {"dataset_root": self.root, "train_size": 8, "val_size": 8}
+        ordinary = prepare_dataset(**config, output_dir=self.output)
+        draft_dir = self.output.with_name("draft")
+        draft = prepare_dataset(**config, output_dir=draft_dir, prompt_style="draft")
+        self.assertNotEqual(ordinary["prompt_sha256"], draft["prompt_sha256"])
+        for split in ("train", "val"):
+            self.assertEqual(
+                (self.output / f"{split}_manifest.jsonl").read_bytes(),
+                (draft_dir / f"{split}_manifest.jsonl").read_bytes(),
+            )
+            rows = pq.read_table(self.output / f"{split}.parquet").to_pylist()
+            draft_rows = pq.read_table(draft_dir / f"{split}.parquet").to_pylist()
+            for row, draft_row in zip(rows, draft_rows, strict=True):
+                self.assertEqual(row.pop("prompt"), [{"role": "user", "content": get_prompt("grpo")}])
+                self.assertEqual(draft_row.pop("prompt"), [{"role": "user", "content": get_prompt("draft")}])
+                self.assertEqual(row, draft_row)
+        with self.assertRaises(FileExistsError):
+            prepare_dataset(**config, output_dir=self.output, prompt_style="draft")
 
     def test_identical_train_val_image_bytes_are_rejected(self):
         for split in ("train", "val", "test"):
@@ -169,7 +195,7 @@ class GrpoPromptResumeTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.directory = self.root / "new_angles_experiment"
+        self.directory = self.root / "new_grpo_experiment"
         self.config = OmegaConf.create({"trainer": {
             "default_local_dir": str(self.directory), "resume_mode": "auto", "resume_from_path": None,
         }})
@@ -180,10 +206,11 @@ class GrpoPromptResumeTests(unittest.TestCase):
 
     def test_auto_resume_rejects_missing_old_or_different_prompt_contract(self):
         (self.directory / "global_step_25").mkdir(parents=True)
-        with self.assertRaisesRegex(ValueError, "without an angles prompt contract"):
+        with self.assertRaisesRegex(ValueError, "without a prompt contract"):
             check_checkpoint_prompt(self.config)
         path = self.directory / "prompt_contract.json"
-        old = {**prompt_contract(), "prompt": DEEPSEEK_EMOTION_PROMPT}
+        old_prompt = get_prompt("draft")
+        old = {**prompt_contract(), "prompt": old_prompt, "reward": "strict_angles_correct_label_0_or_1_v1"}
         path.write_text(json.dumps(old))
         before = path.read_bytes()
         with self.assertRaisesRegex(ValueError, "does not match"):
@@ -198,7 +225,7 @@ class GrpoPromptResumeTests(unittest.TestCase):
         step.mkdir(parents=True)
         self.config.trainer.resume_mode = "resume_path"
         self.config.trainer.resume_from_path = str(step)
-        with self.assertRaisesRegex(ValueError, "without an angles prompt contract"):
+        with self.assertRaisesRegex(ValueError, "without a prompt contract"):
             check_checkpoint_prompt(self.config)
         path = source / "prompt_contract.json"
         path.write_text(json.dumps({**prompt_contract(), "reward": "old_draft_reward"}))

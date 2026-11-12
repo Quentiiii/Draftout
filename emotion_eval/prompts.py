@@ -26,3 +26,9 @@ EMOTION_ANALYSIS_DRAFT_PROMPT = (
     "Finally, output the chosen label in \\boxed{{}}."
 )
 
+GRPO_PROMPT = (
+    "What is the primary emotion conveyed by the image?\n"
+    "Choose exactly one label from: {labels}.\n"
+    "Think step by step about the visible evidence to infer the emotion. "
+    "Finally, output the chosen label in \\boxed{{}}."
+)

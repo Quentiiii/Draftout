@@ -14,15 +14,18 @@ from omegaconf import DictConfig, OmegaConf
 
 def prompt_contract(config: DictConfig | None = None) -> dict:
     """Bind resumable checkpoints to the current prompt and reward semantics."""
-    from emotion_grpo.prepare_data import PROMPT
+    from emotion_grpo.prepare_data import get_prompt
+
+    draft_method = config is not None and config.get("algorithm", {}).get("adv_estimator") == "draft_grpo"
+    prompt = get_prompt("draft" if draft_method else "grpo")
 
     contract = {
         "schema_version": 1,
-        "prompt": PROMPT,
-        "prompt_sha256": hashlib.sha256(PROMPT.encode("utf-8")).hexdigest(),
-        "reward": "strict_angles_correct_label_0_or_1_v1",
+        "prompt": prompt,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "reward": "single_boxed_correct_label_0_or_1_v1",
     }
-    if config is not None and config.get("algorithm", {}).get("adv_estimator") == "draft_grpo":
+    if draft_method:
         draft = config.draft_grpo
         contract.update({
             "schema_version": 2,
@@ -67,7 +70,7 @@ def check_checkpoint_prompt(config: DictConfig) -> dict:
         if not path.is_file():
             if required:
                 raise ValueError(
-                    f"Cannot resume checkpoints without an angles prompt contract: {source}. "
+                    f"Cannot resume checkpoints without a prompt contract: {source}. "
                     "Use a new trainer.experiment_name to train with the current prompt."
                 )
             continue
@@ -81,7 +84,7 @@ def check_checkpoint_prompt(config: DictConfig) -> dict:
             comparable = {**saved, "warmup": {**saved["warmup"], "on_resume": expected["warmup"]["on_resume"]}}
         if comparable != expected:
             raise ValueError(
-                f"Checkpoint prompt/reward contract does not match the current angles recipe: {path}. "
+                f"Checkpoint prompt/reward contract does not match the current recipe: {path}. "
                 "Use a new trainer.experiment_name."
             )
     if expected["schema_version"] == 2:
@@ -144,6 +147,8 @@ def check_config(config: DictConfig) -> None:
             raise ValueError("Draft GRPO uses the existing async vLLM rollout path.")
         if config.custom_reward_function.name != "compute_draft_score":
             raise ValueError("Draft GRPO requires custom_reward_function.name=compute_draft_score.")
+    elif config.custom_reward_function.name != "compute_grpo_score":
+        raise ValueError("Ordinary GRPO requires custom_reward_function.name=compute_grpo_score.")
     if rollout.n < 2 or not rollout.do_sample or rollout.temperature <= 0:
         raise ValueError("GRPO requires at least two sampled answers per image and temperature > 0.")
     if need_reference_policy(config) or need_critic(config) or config.reward_model.enable:
@@ -192,7 +197,7 @@ def check_config(config: DictConfig) -> None:
 def check_data(config: DictConfig) -> dict:
     """Exercise real parquet loading, image processing, templates and rewards."""
     from emotion_eval.data import LABELS
-    from emotion_eval.prompts import EMOTION_ANALYSIS_DRAFT_PROMPT
+    from emotion_grpo.prepare_data import DEFAULT_TRAIN_SIZE, get_prompt
     from verl.trainer.ppo.reward import get_custom_reward_fn
     from verl.utils import hf_processor, hf_tokenizer
     from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -212,19 +217,22 @@ def check_data(config: DictConfig) -> dict:
         raise ValueError("A correctness reward function must be configured.")
 
     draft_method = config.algorithm.adv_estimator == "draft_grpo"
-    result = {"model": str(model_path), "prompt_style": "angles", "splits": {}}
+    prompt_style = "draft" if draft_method else "grpo"
+    result = {"model": str(model_path), "prompt_style": prompt_style, "splits": {}}
     if draft_method:
         result["method"] = "draft_grpo_v1"
-    expected_prompt = EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(LABELS["emoset"]))
+    expected_prompt = get_prompt(prompt_style).removeprefix("<image>\n")
     split_ids = {}
     for split, paths in (("train", config.data.train_files), ("val", config.data.val_files)):
         dataset = RLHFDataset(paths, tokenizer, config.data, processor)
-        if split == "train" and len(dataset) != 2000:
-            raise ValueError(f"Expected exactly 2,000 training examples; found {len(dataset)}.")
+        if split == "train" and len(dataset) != DEFAULT_TRAIN_SIZE:
+            raise ValueError(f"Expected exactly {DEFAULT_TRAIN_SIZE:,} training examples; found {len(dataset)}.")
         if not len(dataset):
             raise ValueError(f"{split} is empty.")
         if split == "train" and len(dataset) % config.data.train_batch_size:
-            raise ValueError("train_batch_size must divide 2,000 so verl's drop_last skips no training images.")
+            raise ValueError(
+                f"train_batch_size must divide {len(dataset):,} so verl's drop_last skips no training images."
+            )
         seen_labels = set()
         ids = set()
         prompt_lengths = []
@@ -279,17 +287,19 @@ def check_data(config: DictConfig) -> dict:
             wrong_label = next(candidate for candidate in LABELS["emoset"] if candidate != label)
             wrong_answer = f"<draft>{plan}</draft>\n{analysis}\n\\boxed{{{wrong_label}}}"
             old_draft_answer = f"<draft>{analysis}</draft>\\boxed{{{label}}}"
+            plain_answer = f"{analysis}\n\\boxed{{{label}}}"
             reward_cases = [
                 (correct_answer, 1.0, {}), (wrong_answer, 0.0, {}),
-                (old_draft_answer, 1.0 if draft_method else 0.0, {}), (label, 0.0, {}),
+                (old_draft_answer, 1.0, {}), (label, 0.0, {}),
+                (plain_answer, 1.0, {}), (f"\\boxed{{{label}}}", 1.0, {}),
+                (correct_answer + f"\\boxed{{{label}}}", 0.0, {}),
             ]
             if draft_method:
                 reward_cases.extend([
-                    (f"\\boxed{{{label}}}", 1.0, {}),
-                    (correct_answer + f"\\boxed{{{label}}}", 0.0, {}),
                     (correct_answer, 1.0, {"draft_grpo_warmup": True}),
                     (wrong_answer, 0.0, {"draft_grpo_warmup": True}),
                     (old_draft_answer, 0.0, {"draft_grpo_warmup": True}),
+                    (plain_answer, 0.0, {"draft_grpo_warmup": True}),
                     (f"\\boxed{{{label}}}", 0.0, {"draft_grpo_warmup": True}),
                 ])
             for answer, expected, reward_context in reward_cases:

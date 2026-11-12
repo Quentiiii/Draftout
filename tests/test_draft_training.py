@@ -290,7 +290,7 @@ class DraftTrainingTests(unittest.TestCase):
 
 
 class DraftLauncherTests(unittest.TestCase):
-    def invoke(self, mode):
+    def invoke(self, mode, use_default_data=False):
         project = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix="draft launcher ") as temporary:
             root = Path(temporary)
@@ -312,6 +312,8 @@ class DraftLauncherTests(unittest.TestCase):
                        GRADIENT_ACCUMULATION_STEPS="2", ROLLOUT_N="4")
             env.pop("BATCH_SIZE", None)
             env.pop("HYDRA_FULL_ERROR", None)
+            if use_default_data:
+                env.pop("DATA_DIR")
             result = subprocess.run(["bash", str(project / "scripts/run_emoset_draft_grpo.sh"), mode],
                                     env=env, text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -321,7 +323,18 @@ class DraftLauncherTests(unittest.TestCase):
                 self.assertIn("fake training exception on stderr", logged)
             else:
                 self.assertFalse(training_log.exists())
-            return [json.loads(row) for row in calls.read_text().splitlines()]
+            recorded = [json.loads(row) for row in calls.read_text().splitlines()]
+            prepare = recorded[0]["args"]
+            self.assertEqual(prepare[:2], ["-m", "emotion_grpo.prepare_data"])
+            self.assertEqual(prepare[prepare.index("--prompt-style") + 1], "draft")
+            self.assertEqual(prepare[prepare.index("--train-size") + 1], "8000")
+            return recorded
+
+    def test_prepare_preserves_draft_prompt_in_its_separate_data_directory(self):
+        calls = self.invoke("--prepare-only", use_default_data=True)
+        self.assertEqual(len(calls), 1)
+        args = calls[0]["args"]
+        self.assertTrue(args[args.index("--output-dir") + 1].endswith("/outputs/emoset_grpo/data_draft_8k_seed42"))
 
     def test_check_selects_draft_config_and_hides_cuda_for_preflight(self):
         calls = self.invoke("--check")
@@ -336,10 +349,12 @@ class DraftLauncherTests(unittest.TestCase):
         overrides = dict(arg.split("=", 1) for arg in calls[-1]["args"] if "=" in arg)
         self.assertEqual(overrides["trainer.total_training_steps"], "21")
         self.assertEqual(overrides["trainer.resume_mode"], "disable")
-        self.assertEqual(overrides["trainer.experiment_name"], "emoset_draft_grpo_2b_2k_warmup20_fallback_smoke")
+        self.assertEqual(overrides["trainer.experiment_name"], "emoset_draft_grpo_2b_8k_warmup20_fallback_smoke")
         self.assertEqual(overrides["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"], "8")
         self.assertEqual(overrides["data.train_batch_size"], "8")
         self.assertEqual(overrides["actor_rollout_ref.rollout.n"], "4")
+        keys = [arg.split("=", 1)[0] for arg in calls[-1]["args"] if "=" in arg]
+        self.assertEqual(len(keys), len(set(keys)), "Smoke must not rely on conflicting overrides")
 
 
 if __name__ == "__main__":

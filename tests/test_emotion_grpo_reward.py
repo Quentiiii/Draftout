@@ -1,7 +1,7 @@
 import unittest
 
 from emotion_eval.data import LABELS
-from emotion_grpo.reward import compute_score
+from emotion_grpo.reward import compute_draft_score, compute_grpo_score, compute_score
 
 
 def answer(label, draft="Examine the expression and scene.", analysis="The visible expression supports this emotion."):
@@ -9,6 +9,63 @@ def answer(label, draft="Examine the expression and scene.", analysis="The visib
 
 
 class EmotionGRPORewardTests(unittest.TestCase):
+    def test_plain_grpo_reasoning_uses_boxed_accuracy_without_draft_tags(self):
+        for label in LABELS["emoset"]:
+            with self.subTest(label=label):
+                response = (
+                    "First consider the facial expression. Then consider the scene and colors.\n"
+                    f"\\boxed{{ {label.upper()} }}"
+                )
+                self.assertEqual(compute_grpo_score("emoset", response, label.lower()), 1.0)
+                wrong = "Anger" if label != "Anger" else "Fear"
+                self.assertEqual(compute_grpo_score("emoset", response, wrong), 0.0)
+
+    def test_plain_grpo_does_not_infer_answers_from_reasoning(self):
+        for response in (
+            None, 1, "", "Amusement", "The playful scene suggests Amusement.",
+            r"The scene suggests Amusement. \boxed{Awe}",
+            r"\boxed{Amusement or Awe}", r"\boxed{happy}", r"\boxed{}",
+            r"\boxed{Amusement", r"\boxed{{Amusement}}",
+            r"\boxed{Amusement}\boxed{Amusement}",
+            r"\boxed{Amusement}\boxed{Awe}",
+            r"\boxed{Amusement}\boxed{", r"\boxed{ \boxed{Amusement}",
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(compute_grpo_score("emoset", response, "Amusement"), 0.0)
+
+    def test_plain_grpo_and_draft_phase_share_task_reward(self):
+        for response in (
+            r"A playful expression suggests amusement. \boxed { Amusement }",
+            r"\boxed{Amusement}", answer("Amusement"), answer("Awe"),
+            r"\boxed{Amusement}\boxed{Awe}", None,
+        ):
+            with self.subTest(response=response):
+                ordinary = compute_grpo_score("emoset", response, "Amusement")
+                draft = compute_draft_score("emoset", response, "Amusement")
+                self.assertEqual(ordinary, draft["task_reward"])
+                self.assertEqual(ordinary, draft["score"])
+
+    def test_draft_warmup_still_requires_draft_and_separate_analysis(self):
+        plain_response = r"The playful scene supports amusement. \boxed{Amusement}"
+        warmup = compute_draft_score(
+            "emoset", plain_response, "Amusement", extra_info={"draft_grpo_warmup": True}
+        )
+        self.assertEqual(warmup, {"score": 0.0, "task_reward": 1.0, "format_valid": 0.0})
+        self.assertEqual(compute_score("emoset", plain_response, "Amusement"), 0.0)
+        self.assertEqual(compute_grpo_score("emoset", plain_response, "Amusement"), 1.0)
+        self.assertEqual(
+            compute_draft_score(
+                "emoset", answer("Amusement"), "Amusement", extra_info={"draft_grpo_warmup": True}
+            ),
+            {"score": 1.0, "task_reward": 1.0, "format_valid": 1.0},
+        )
+
+    def test_plain_grpo_rejects_unknown_ground_truth(self):
+        for truth in ("", None, 0, "Joy", "Anger or Fear"):
+            with self.subTest(truth=truth):
+                with self.assertRaisesRegex(ValueError, "ground-truth"):
+                    compute_grpo_score("emoset", r"\boxed{Anger}", truth)
+
     def test_all_eight_classes_and_case_insensitive_ground_truth(self):
         for label in LABELS["emoset"]:
             with self.subTest(label=label):

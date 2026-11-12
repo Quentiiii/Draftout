@@ -4,7 +4,7 @@ defaults:
 
 # Paths are absolute so Ray workers use the same local files.
 project_root: /data/xiyan.zhao/work/Draftout
-data_dir: ${project_root}/outputs/emoset_grpo/data_angles_concise_20261110
+data_dir: ${project_root}/outputs/emoset_grpo/data_grpo_8k_seed42
 dry_run: false
 
 data:
@@ -13,10 +13,10 @@ data:
   val_files: ["${data_dir}/val.parquet"]
   train_batch_size: 8
   max_prompt_length: 1024
-  # Draft outline, separate evidence analysis, then the boxed emotion label.
+  # GRPO_PROMPT: step-by-step evidence analysis, then the boxed emotion label.
   max_response_length: 1024
   image_patch_size: 16
-  # Do not silently remove any of the selected 2,000 examples.
+  # Do not silently remove any of the selected 8,000 examples.
   filter_overlong_prompts: false
   truncation: error
   dataloader_num_workers: 2
@@ -126,17 +126,17 @@ reward_manager:
 
 custom_reward_function:
   path: ${project_root}/emotion_grpo/reward.py
-  name: compute_score
+  name: compute_grpo_score
 
 trainer:
   project_name: Draftout
-  experiment_name: emoset_grpo_2b_angles_concise_2k_20261110
+  experiment_name: emoset_grpo_2b_8k
   logger: [console]
   nnodes: 1
   n_gpus_per_node: 2
   use_legacy_worker_impl: enable
-  # Current concise draft run: 250 steps/epoch at the default effective batch.
-  total_epochs: 10
+  # 8,000 training images: 1,000 steps/epoch at the default effective batch.
+  total_epochs: 2
   val_before_train: true
   test_freq: 25
   save_freq: 25

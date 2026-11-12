@@ -356,22 +356,28 @@ bash scripts/run_deepseek_emoset.sh \
 `splits/emoset_test_2000.json` 从此前 `Qwen3-VL/splits/emoset_test_2000.json` 原样复制，
 从官方 17,716 张测试图片中按原始类别比例分层抽样，seed 为 `20260612`，
 包含 2,000 张互不重复的图片，不包含训练样本。运行时检查清单属于官方测试集，
-并核对图片、annotation 和类别。该旧测试子集与下方 GRPO 训练用的 2,000 张样本相互独立。
+并核对图片、annotation 和类别。该旧测试子集与下方 GRPO 训练用的 8,000 张样本相互独立。
 
-## EmoSet 2k 纯 GRPO 训练
+## EmoSet 8k 纯 GRPO 训练
 
 入口是 `scripts/run_emoset_grpo.sh`，使用 `vision-opd`、本仓库 `verl` 和原版
 `/data/xiyan.zhao/work/model/Qwen3.5-2B`。当前实验为
-`emoset_grpo_2b_angles_concise_2k_20261110`，总共 **10 epochs**；默认恢复该实验最新 checkpoint。
+`emoset_grpo_2b_8k`，总共 **2 epochs**；默认恢复该实验最新 checkpoint。
+普通 GRPO 与下方 Draft GRPO 使用相同的 8,000 张训练样本，但提示词与数据目录分别保存，各自训练 2 epochs。
+实验使用新的独立目录；没有 checkpoint 时从原版模型开始。
 
-训练与 `--prompt-style angles` 评估入口共用 `emotion_eval/prompts.py` 的 `EMOTION_ANALYSIS_DRAFT_PROMPT`：
-在 `<draft>...</draft>` 中只列出 1–3 个与情绪有关的分析角度，不作分析；
-在标签外用一个简洁段落综合分析图片证据，最后输出 `\boxed{类别}`。
-训练消息额外包含一个 `<image>` 占位符；CLI 的 `angles` 名称保留兼容。
+普通 GRPO 使用 `emotion_eval/prompts.py` 的 `GRPO_PROMPT`：
 
-`emotion_grpo/reward.py` 复用 angles 严格解析器：非空 draft、独立分析、唯一末尾 boxed
-均齐全且情绪类别正确得 **1**，其他情况得 **0**。类别忽略大小写，解释中提到的情绪
-不参与答案判定；不额外奖励解释质量，也不以列表行数启发式判断角度数。
+```text
+What is the primary emotion conveyed by the image?
+Choose exactly one label from: {labels}.
+Think step by step about the visible evidence to infer the emotion. Finally, output the chosen label in \boxed{}.
+```
+
+训练消息额外包含一个 `<image>` 占位符。`emotion_grpo/reward.py` 中的
+`compute_grpo_score` 按唯一合法 `\boxed{类别}` 判定，类别正确得 **1**，错误、缺少、
+多个 boxed 或无法解析得 **0**。类别忽略大小写，解释中提到的情绪不参与答案判定。
+该奖励不要求 `<draft>`、固定分析长度或 boxed 后没有文字。
 独立 thinking 模式关闭，完整输出上限为 **1,024 tokens**；
 `max_prompt_length=1024`，`rollout.max_model_len=2048`。
 
@@ -380,10 +386,10 @@ bash scripts/run_deepseek_emoset.sh \
 训练 rollout 保留 `temperature=1, top_p=1`，每张图采样 4 个回答；验证使用单回答贪心解码。
 学习率为 `1e-6`，训练和 rollout 使用 BF16/FSDP2，参数与优化器状态启用 CPU offload。
 
-数据默认保存在 `outputs/emoset_grpo/data_angles_concise_20261110/`：
+数据默认保存在 `outputs/emoset_grpo/data_grpo_8k_seed42/`：
 
-- 官方 train 中固定抽取 **2,000** 张，每类 250 张；官方 val 中固定抽取 **256** 张，每类 32 张，seed=42。
-- 选样与之前的实验一致，当前目录保存新版提示词及独立数据产物。
+- 官方 train 中固定抽取 **8,000** 张，每类 1,000 张；官方 val 中固定抽取 **256** 张，每类 32 张，seed=42。
+- 使用固定种子按类别无放回抽样，当前目录保存提示词与独立数据产物；训练数据不使用官方 test 或旧的 2,000 张测试子集。
 - 检查 train/val/test 清单互斥、图片和 annotation 存在、标签一致、训练与验证图片内容无重合。
 - 保存 parquet、两份样本 manifest、来源哈希及提示词哈希。重复准备相同数据会校验并复用；
   不同内容需使用新目录，或显式调用数据准备模块的 `--overwrite`。
@@ -400,7 +406,7 @@ bash scripts/run_emoset_grpo.sh --prepare-only
 CUDA_VISIBLE_DEVICES=2 GRADIENT_ACCUMULATION_STEPS=4 \
   bash scripts/run_emoset_grpo.sh --check
 
-# GPU 2 单卡训练：每步 8 张图 / 32 条回答，10 epochs = 2,500 steps
+# GPU 2 单卡训练：每步 8 张图 / 32 条回答，2 epochs = 2,000 steps
 CUDA_VISIBLE_DEVICES=2 GRADIENT_ACCUMULATION_STEPS=4 \
   bash scripts/run_emoset_grpo.sh
 
@@ -416,12 +422,12 @@ CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_emoset_grpo.sh
 mkdir -p outputs/emoset_grpo/logs
 nohup env CUDA_VISIBLE_DEVICES=2,3 \
   bash scripts/run_emoset_grpo.sh \
-  > outputs/emoset_grpo/logs/draft_2b.log 2>&1 &
-tail -f outputs/emoset_grpo/logs/draft_2b.log
+  > outputs/emoset_grpo/logs/grpo_2b.log 2>&1 &
+tail -f outputs/emoset_grpo/logs/grpo_2b.log
 ```
 
 默认 checkpoint 目录是
-`outputs/emoset_grpo/checkpoints/emoset_grpo_2b_angles_concise_2k_20261110/`。
+`outputs/emoset_grpo/checkpoints/emoset_grpo_2b_8k/`。
 每 25 steps 验证并保存，最多保留两份 actor checkpoint；同时保存训练配置、
 验证输出以及 `prompt_contract.json`。恢复时校验 prompt 和奖励规则，拒绝旧 prompt
 或缺少契约的 checkpoint。中断后以相同模型、数据、GPU 数和 batch 设置重新执行同一命令即可。
@@ -430,21 +436,21 @@ tail -f outputs/emoset_grpo/logs/draft_2b.log
 ```bash
 # 修改训练总轮数或学习率
 CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_emoset_grpo.sh \
-  trainer.total_epochs=5 actor_rollout_ref.actor.optim.lr=5e-7
+  trainer.total_epochs=2 actor_rollout_ref.actor.optim.lr=5e-7
 
 # 另一份全新实验
 CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_emoset_grpo.sh \
-  trainer.resume_mode=disable trainer.experiment_name=emoset_grpo_2b_draft_run2
+  trainer.resume_mode=disable trainer.experiment_name=emoset_grpo_2b_8k_run2
 
 # 可选的真实 GPU 单步训练；--check 不等价于这项 GPU 检查
-# 输出到独立的 emoset_grpo_2b_angles_concise_2k_smoke 目录
+# 输出到独立的 emoset_grpo_2b_8k_smoke 目录
 CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_emoset_grpo.sh --smoke
 ```
 
 单卡 micro batch 默认 **8**、梯度累积默认 **2**、每图回答数默认 **4**，
 两卡下每步仍处理 8 张图 / 32 条回答，与原训练的有效 batch 相同。
 计算公式为 `每步图片数 = BATCH_SIZE × GRADIENT_ACCUMULATION_STEPS × GPU 数 / ROLLOUT_N`。
-每步图片数必须为整数并整除 2,000；脚本会在加载数据前检查。
+每步图片数必须为整数并整除 8,000；脚本会在加载数据前检查。
 actor/log-prob micro batch、有效 batch 和 GPU 数统一由脚本推导，不能单独用 Hydra 覆盖。
 其他 Hydra 参数可按上述形式追加。
 
@@ -452,21 +458,24 @@ Qwen3.5 使用保留 padding 的独立批次维度，关闭动态 batch，SP=1�
 `BATCH_SIZE=1` 时才自动启用单样本去 padding；所有批次仍须满足整除约束。
 也可通过环境变量覆盖 `PYTHON_BIN`、`MODEL_PATH`、`EMOSET_ROOT`、`DATA_DIR`。
 
-旧普通 draft 与旧 angles GRPO 实验已于 2026-11-11 清理，包括其验证输出、
-checkpoint、专属数据、日志、诊断及旧 GRPO 测试集评测结果；旧合并模型此前已删除。
-清理清单见 `outputs/cleanup_old_grpo_experiments_20261111.json`。
-当前 concise 实验、原版 `work/model/Qwen3.5-2B` 及未训练模型的基线评测结果保留。
+此前的非 DeepSeek 输出已于 2026-11-12 清理，包括 GRPO checkpoint、合并模型、
+验证和测试输出、基线结果及日志；DeepSeek 结果和外部原版模型保留。
+本节的 8k 配置使用新的数据和实验目录。
 
 ## 2×2 Draft GRPO：全局收缩与分段 advantage
 
 入口是 `scripts/run_emoset_draft_grpo.sh`，复用原训练脚本、数据、vLLM rollout、
 奖励接口和 PPO clipped loss。配置位于 `verl/trainer/config/emoset_draft_grpo.yaml`，
-独立实验目录为 `outputs/emoset_grpo/checkpoints/emoset_draft_grpo_2b_2k_warmup20_fallback/`。
-20 步预热和格式兜底使用新目录，避免与旧实验的方法契约冲突；原实验结果保留。
+独立实验目录为 `outputs/emoset_grpo/checkpoints/emoset_draft_grpo_2b_8k_warmup20_fallback/`。
+与普通 GRPO 使用相同的 8,000 张训练图和 256 张验证图，总共训练 2 epochs。
 原来的 `run_emoset_grpo.sh` 仍可用于普通 GRPO。
 
-使用当前 `EMOTION_ANALYSIS_DRAFT_PROMPT`。**从头训练先完成 20 次普通 GRPO 更新**，
-使用原严格格式且分类正确才得 1 分的奖励；这 20 步计入累计 `global_step`，第 21 步切到 Draft GRPO。
+使用当前 `EMOTION_ANALYSIS_DRAFT_PROMPT`，在 `<draft>...</draft>` 内只列 1–3 个分析角度，
+然后用一段正文联合分析，最后给出 boxed 答案。数据独立保存在
+`outputs/emoset_grpo/data_draft_8k_seed42/`，与普通 GRPO 的样本 ID 一致。
+**从头训练先完成 20 次普通 GRPO 更新**；预热也使用 Draft 提示词，
+仍要求非空 draft、独立分析、唯一末尾 boxed 且分类正确才得 1 分。
+这 20 步计入累计 `global_step`，第 21 步切到 Draft GRPO。
 **断点恢复默认不重新预热**（`draft_grpo.warmup_on_resume=false`）：例如恢复第 100 步，
 第 101 步直接进行 Draft 更新，沿用 checkpoint 中的模型、优化器和 EMA 状态。
 验证不计入 warmup，始终使用原单回答贪心流程，并记录分类准确率及格式通过率。
@@ -551,7 +560,8 @@ CUDA_VISIBLE_DEVICES='' /data/xiyan.zhao/anaconda3/envs/vision-opd/bin/python \
 ```
 
 Draft GRPO 入口默认单卡 batch 8、梯度累计 2；两卡每步 8 张图 / 32 条完整回答。
-2,000 张训练图每个 epoch 为 250 步，10 epochs 共 2,500 步。
+8,000 张训练图每个 epoch 为 1,000 步，2 epochs 共 2,000 步。
+从头训练的 20 步普通 GRPO 预热包含在这 2,000 步中，随后执行 1,980 步 Draft GRPO。
 可通过 `BATCH_SIZE` 和 `GRADIENT_ACCUMULATION_STEPS` 覆盖。
 日志包含 `draft/reward_mean`、`draft/MS_B`、`draft/MS_W`、`draft/s`、
 `draft/mean_abs_draft_adv`、`draft/mean_abs_suffix_adv`，以及 `draft/warmup`、

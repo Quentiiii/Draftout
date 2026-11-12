@@ -14,15 +14,24 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from emotion_eval.data import IMAGE_SUFFIXES, LABELS, canonical_label
-from emotion_eval.prompts import EMOTION_ANALYSIS_DRAFT_PROMPT
+from emotion_eval.prompts import EMOTION_ANALYSIS_DRAFT_PROMPT, GRPO_PROMPT
 
 EMOSET_LABELS = LABELS["emoset"]
-PROMPT = "<image>\n" + EMOTION_ANALYSIS_DRAFT_PROMPT.format(labels=", ".join(EMOSET_LABELS))
 DEFAULT_DATASET_ROOT = Path("/data/xiyan.zhao/work/dataset/EMOSET")
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "emoset_grpo" / "data_angles_concise_20261110"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "emoset_grpo" / "data_grpo_8k_seed42"
+DEFAULT_DRAFT_OUTPUT_DIR = DEFAULT_OUTPUT_DIR.with_name("data_draft_8k_seed42")
+DEFAULT_TRAIN_SIZE = 8000
 ARTIFACT_NAMES = (
     "train.parquet", "val.parquet", "train_manifest.jsonl", "val_manifest.jsonl", "metadata.json",
 )
+
+
+def get_prompt(prompt_style: str = "grpo") -> str:
+    """Select a method's prompt without changing its sampled images or labels."""
+    templates = {"grpo": GRPO_PROMPT, "draft": EMOTION_ANALYSIS_DRAFT_PROMPT}
+    if prompt_style not in templates:
+        raise ValueError(f"Unknown GRPO prompt style: {prompt_style!r}")
+    return "<image>\n" + templates[prompt_style].format(labels=", ".join(EMOSET_LABELS))
 
 
 @dataclass(frozen=True)
@@ -125,8 +134,10 @@ def _existing_file(root: Path, relative: str) -> Path:
 
 def make_rows(
     root: Path, split: str, entries: list[SplitEntry], min_pixels: int = 65536, max_pixels: int = 262144,
+    prompt_style: str = "grpo",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate selected annotations and keep per-example answers out of prompts."""
+    prompt = get_prompt(prompt_style)
     rows, manifest = [], []
     seen_paths: set[Path] = set()
     for index, entry in enumerate(entries):
@@ -150,7 +161,7 @@ def make_rows(
         sample_id = hashlib.sha256(entry.image.encode("utf-8")).hexdigest()
         rows.append({
             "data_source": "emoset",
-            "prompt": [{"role": "user", "content": PROMPT}],
+            "prompt": [{"role": "user", "content": prompt}],
             "images": [{"image": str(image_path), "min_pixels": min_pixels, "max_pixels": max_pixels}],
             "ability": "emotion_classification",
             "reward_model": {"style": "rule", "ground_truth": label},
@@ -177,19 +188,23 @@ def _write_json(path: Path, value: Any) -> None:
 
 def prepare_dataset(
     dataset_root: Path = DEFAULT_DATASET_ROOT,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
-    train_size: int = 2000,
+    output_dir: Path | None = None,
+    train_size: int = DEFAULT_TRAIN_SIZE,
     val_size: int = 256,
     seed: int = 42,
     sampling: str = "balanced",
     min_pixels: int = 65536,
     max_pixels: int = 262144,
     overwrite: bool = False,
+    prompt_style: str = "grpo",
 ) -> dict[str, Any]:
     """Build all artifacts, refusing to silently replace a different dataset."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    prompt = get_prompt(prompt_style)
+    if output_dir is None:
+        output_dir = DEFAULT_DRAFT_OUTPUT_DIR if prompt_style == "draft" else DEFAULT_OUTPUT_DIR
     root = Path(dataset_root).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
     if min_pixels <= 0 or max_pixels < min_pixels:
@@ -212,8 +227,8 @@ def prepare_dataset(
         "dataset": "emoset",
         "config": config,
         "labels": list(EMOSET_LABELS),
-        "prompt": PROMPT,
-        "prompt_sha256": hashlib.sha256(PROMPT.encode("utf-8")).hexdigest(),
+        "prompt": prompt,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "selection": "Sort by relative image path, sample without replacement, then shuffle with random.Random(seed).",
         "sources": {
             split: {
@@ -240,7 +255,7 @@ def prepare_dataset(
         manifests = {}
         for split, count in (("train", train_size), ("val", val_size)):
             selected = select_entries(splits[split], count, seed, sampling)
-            rows, manifest = make_rows(root, split, selected, min_pixels, max_pixels)
+            rows, manifest = make_rows(root, split, selected, min_pixels, max_pixels, prompt_style)
             manifests[split] = manifest
             pq.write_table(pa.Table.from_pylist(rows), stage / f"{split}.parquet", compression="snappy")
             (stage / f"{split}_manifest.jsonl").write_text(
@@ -281,8 +296,9 @@ def prepare_dataset(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--train-size", type=int, default=2000)
+    parser.add_argument("--output-dir", type=Path, help="Defaults to the selected method's data directory.")
+    parser.add_argument("--prompt-style", choices=("grpo", "draft"), default="grpo")
+    parser.add_argument("--train-size", type=int, default=DEFAULT_TRAIN_SIZE)
     parser.add_argument("--val-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sampling", choices=("balanced", "random"), default="balanced")
@@ -290,6 +306,8 @@ def main() -> None:
     parser.add_argument("--max-pixels", type=int, default=262144)
     parser.add_argument("--overwrite", action="store_true", help="Replace existing, different GRPO artifacts.")
     args = parser.parse_args()
+    if args.output_dir is None:
+        args.output_dir = DEFAULT_DRAFT_OUTPUT_DIR if args.prompt_style == "draft" else DEFAULT_OUTPUT_DIR
     try:
         metadata = prepare_dataset(**vars(args))
     except (OSError, ValueError) as exc:
@@ -298,6 +316,7 @@ def main() -> None:
         "output_dir": str(args.output_dir.expanduser().resolve()),
         "seed": metadata["config"]["seed"],
         "sampling": metadata["config"]["sampling"],
+        "prompt_style": args.prompt_style,
         "subsets": metadata["subsets"],
     }, indent=2))
 

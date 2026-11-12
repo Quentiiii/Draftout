@@ -1,9 +1,35 @@
 """Binary EmoSet correctness reward for verl's custom reward interface."""
 
 import re
+from collections.abc import Sequence
 
 from emotion_eval.data import LABELS, canonical_label
 from emotion_eval.metrics import parse_angles_prediction
+
+
+def _parse_single_boxed_label(solution_str, labels: Sequence[str]) -> str | None:
+    """Accept exactly one boxed canonical label, regardless of reasoning format."""
+    if not isinstance(solution_str, str):
+        return None
+    # Count even malformed boxes so a second, broken answer is not ignored.
+    if len(re.findall(r"\\boxed\b", solution_str)) != 1:
+        return None
+    match = re.search(r"\\boxed\s*\{([^{}]*)\}", solution_str)
+    return canonical_label(match.group(1), labels) if match is not None else None
+
+
+def compute_grpo_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> float:
+    """Reward ordinary GRPO by boxed accuracy without requiring draft tags.
+
+    Reasoning may use any format. Only one unambiguous, canonical boxed answer
+    determines correctness; absent, malformed, multiple, or wrong answers earn
+    zero, using the same task-accuracy parser as the Draft stage.
+    """
+    labels = LABELS["emoset"]
+    truth = canonical_label(ground_truth, labels)
+    if truth is None:
+        raise ValueError(f"Unknown ground-truth EmoSet emotion: {ground_truth!r}")
+    return float(_parse_single_boxed_label(solution_str, labels) == truth)
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> float:
@@ -35,14 +61,9 @@ def compute_draft_score(data_source, solution_str, ground_truth, extra_info=None
     truth = canonical_label(ground_truth, labels)
     if truth is None:
         raise ValueError(f"Unknown ground-truth EmoSet emotion: {ground_truth!r}")
-    prediction = None
+    prediction = _parse_single_boxed_label(solution_str, labels)
     format_valid = False
     if isinstance(solution_str, str):
-        # Count even malformed boxes so a second, broken answer is not ignored.
-        if len(re.findall(r"\\boxed\b", solution_str)) == 1:
-            match = re.search(r"\\boxed\s*\{([^{}]*)\}", solution_str)
-            if match is not None:
-                prediction = canonical_label(match.group(1), labels)
         format_valid = parse_angles_prediction(solution_str, labels) is not None
     task_reward = float(prediction == truth)
     warmup = bool((extra_info or {}).get("draft_grpo_warmup", False))

@@ -65,7 +65,8 @@ class GrpoLauncherTests(unittest.TestCase):
         self.assertEqual(calls[0][:2], ["-m", "emotion_grpo.prepare_data"])
         self.assertEqual(calls[1][:2], ["-m", "emotion_grpo.train"])
         self.assertIn("--train-size", calls[0])
-        self.assertEqual(calls[0][calls[0].index("--train-size") + 1], "2000")
+        self.assertEqual(calls[0][calls[0].index("--train-size") + 1], "8000")
+        self.assertEqual(calls[0][calls[0].index("--prompt-style") + 1], "grpo")
         options = calls[1][2:]
         keys = [option.split("=", 1)[0] for option in options]
         self.assertEqual(len(keys), len(set(keys)), "Conflicting duplicate Hydra overrides")
@@ -83,7 +84,7 @@ class GrpoLauncherTests(unittest.TestCase):
         self.assertEqual(overrides["trainer.nnodes"], "1")
         self.assertEqual(overrides["actor_rollout_ref.model.use_remove_padding"], str(batch == 1).lower())
         self.assertEqual(int(overrides["data.train_batch_size"]) * rollout_n, responses)
-        self.assertEqual(2000 % prompts, 0)
+        self.assertEqual(8000 % prompts, 0)
 
     def test_defaults_use_batch8_accumulation2_with_same_effective_batch(self):
         result, calls = self.run_launcher()
@@ -91,6 +92,23 @@ class GrpoLauncherTests(unittest.TestCase):
         self.assert_batch_shape(overrides, batch=8, accumulation=2, gpu_count=2)
         self.assertTrue(overrides["actor_rollout_ref.model.path"].endswith("/model with spaces"))
         self.assertTrue(overrides["data_dir"].endswith("/data with spaces"))
+
+    def test_default_data_directory_is_separate_from_draft_prompt(self):
+        result, calls = self.run_launcher(DATA_DIR="")
+        overrides = self.training_overrides(result, calls)
+        self.assertEqual(overrides["data_dir"], str(PROJECT_DIR / "outputs/emoset_grpo/data_grpo_8k_seed42"))
+        self.assertEqual(calls[0][calls[0].index("--output-dir") + 1], overrides["data_dir"])
+
+    def test_recipe_config_cannot_silently_change_the_prepared_prompt(self):
+        for arguments in (("--config-name", "emoset_draft_grpo"),
+                          ("--config-name=emoset_draft_grpo",)):
+            with self.subTest(arguments=arguments):
+                result, calls = self.run_launcher(*arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+                self.assertIn("emoset_grpo", result.stderr)
+        result, calls = self.run_launcher("--config-name", "emoset_grpo")
+        self.training_overrides(result, calls)
 
     def test_environment_controls_effective_batch_and_padding(self):
         for batch, accumulation, devices, gpu_count, rollout_n in (
@@ -100,6 +118,7 @@ class GrpoLauncherTests(unittest.TestCase):
             (16, 2, "3", 1, 4),
             (1, 32, "0,1", 2, 4),
             (16, 2, "0,1", 2, 8),
+            (16, 4, "0,1", 2, 4),
         ):
             with self.subTest(batch=batch, accumulation=accumulation, devices=devices, rollout_n=rollout_n):
                 result, calls = self.run_launcher(
@@ -131,7 +150,7 @@ class GrpoLauncherTests(unittest.TestCase):
         self.assertEqual(overrides["trainer.total_training_steps"], "1")
         self.assertEqual(overrides["trainer.val_before_train"], "false")
         self.assertEqual(overrides["trainer.resume_mode"], "disable")
-        self.assertEqual(overrides["trainer.experiment_name"], "emoset_grpo_2b_angles_concise_2k_smoke")
+        self.assertEqual(overrides["trainer.experiment_name"], "emoset_grpo_2b_8k_smoke")
 
     def test_check_and_smoke_modes_keep_batch_controls(self):
         for mode in ("--check", "--smoke"):
@@ -142,7 +161,7 @@ class GrpoLauncherTests(unittest.TestCase):
                 if mode == "--check":
                     self.assertEqual(overrides["dry_run"], "true")
                 else:
-                    self.assertEqual(overrides["trainer.experiment_name"], "emoset_grpo_2b_angles_concise_2k_smoke")
+                    self.assertEqual(overrides["trainer.experiment_name"], "emoset_grpo_2b_8k_smoke")
                     self.assertEqual(overrides["trainer.resume_mode"], "disable")
                     self.assertEqual(overrides["trainer.total_training_steps"], "1")
                     self.assertEqual(overrides["trainer.val_before_train"], "false")
@@ -152,6 +171,7 @@ class GrpoLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(calls), 1, calls)
         self.assertEqual(calls[0][:2], ["-m", "emotion_grpo.prepare_data"])
+        self.assertEqual(calls[0][calls[0].index("--prompt-style") + 1], "grpo")
         result, calls = self.run_launcher("--help")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(calls, [])
@@ -171,7 +191,7 @@ class GrpoLauncherTests(unittest.TestCase):
         for environment in (
             {"BATCH_SIZE": "1", "GRADIENT_ACCUMULATION_STEPS": "1"},
             {"BATCH_SIZE": "3", "GRADIENT_ACCUMULATION_STEPS": "2"},
-            {"BATCH_SIZE": "16", "GRADIENT_ACCUMULATION_STEPS": "4"},
+            {"BATCH_SIZE": "16", "GRADIENT_ACCUMULATION_STEPS": "16"},
             {"BATCH_SIZE": "4611686018427387920"},
         ):
             with self.subTest(environment=environment):
